@@ -1,0 +1,39 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-latest-tag
+spec:
+  rules:
+    - name: require-image-tag
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      validate:
+        failureAction: Enforce
+        message: "La imagen debe especificar un tag explicito. Usa una version fija, por ejemplo nginx-1.29-alpine"
+        pattern:
+          spec:
+            containers:
+              - image: "*:*"
+            =(initcontainers):
+              - image: "*:*"
+            =(ephemeralContainers):
+              - image: "*:*"
+    - name: validate-image-tag
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      validate:
+        failureAction: Enforce
+        message: "La imagen no puede ser latest. Usa una version fija, por ejemplo nginx-1.29-alpine"
+        pattern:
+          spec:
+            containers:
+              - image: "!*:latest"
+            =(initContainers):
+              - image: "!*:latest"
+            =(ephemeralContainers):
+              - image: "!*:latest"
+
