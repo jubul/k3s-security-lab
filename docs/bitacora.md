@@ -496,3 +496,164 @@ El agujero sobrevive exactamente en la intersección de las dos condiciones: ini
 **De ahí la decisión de versionar los casos negativos** en `tests/`, un archivo por caso, ejecutables en conjunto con `kubectl apply -f tests/ --dry-run=server`. Y el paso siguiente natural es el CLI `kyverno test`, que declara el resultado esperado de cada caso y corre sin cluster: eso permite meter las políticas en CI y evitar que un pull request mergee una regla que abre un agujero.
 
 **Nota de método:** en esta sesión se instruyó a usar heredocs de bash (`<<'EOF'`) para las pruebas, sintaxis que la shell del entorno (fish) no soporta. El incidente reorientó la solución hacia algo mejor: los casos de prueba como archivos versionados en el repositorio en lugar de comandos escritos en la terminal y perdidos.
+
+---
+
+## #9 — Una detección que sí ocurrió y se dio por ausente: el filtro por prioridad
+
+**Fecha:** 2026-08-18 · **Módulo:** 5 (Falco) · **Estado:** resuelto
+
+### Síntoma
+
+Tras instalar Falco y simular una intrusión (`kubectl exec` a un pod, `cat /etc/shadow`), se observó **una sola alerta**: la lectura del archivo sensible. La apertura de la shell no aparecía, pese a ser el evento más evidente de los dos.
+
+La primera hipótesis fue que la regla no estaba en el set cargado: en versiones recientes de Falco el ruleset por defecto se redujo y varias reglas ruidosas se movieron a los sets `incubating` y `sandbox`, que no se cargan solos.
+
+### Diagnóstico
+
+La hipótesis era falsa. Inspeccionando el set efectivamente cargado dentro del pod:
+
+```
+reglas totales cargadas: 25
+- rule: Run shell untrusted
+- rule: Terminal shell in container    ← presente
+```
+
+La regla estaba cargada. Extrayéndola completa apareció la causa:
+
+```yaml
+- rule: Terminal shell in container
+  condition: spawned_process and container and shell_procs and proc.tty != 0 and container_entrypoint ...
+  priority: NOTICE          ← acá
+```
+
+El comando usado para revisar las alertas era `kubectl logs ... | grep -i warning`. La regla tiene prioridad **NOTICE**, así que el filtro la descartaba. Listando sin filtrar:
+
+```
+Notice   | Terminal shell in container      | intruso | sh
+Warning  | Read sensitive file untrusted    | intruso | cat /etc/shadow
+```
+
+Las dos alertas habían disparado desde el primer momento.
+
+### Causa raíz
+
+Un filtro aplicado sobre la propia salida de diagnóstico, sin verificar que el rango de severidades filtrado incluyera lo que se estaba buscando.
+
+Escala de prioridades de Falco, de mayor a menor: `EMERGENCY`, `ALERT`, `CRITICAL`, `ERROR`, `WARNING`, `NOTICE`, `INFORMATIONAL`, `DEBUG`.
+
+### Aprendizaje
+
+**Es el tercer incidente del proyecto con la misma forma:** el `head -5` que llevó a concluir que no había servidor DHCP (#6), el caso de prueba que no cubría la intersección de dos condiciones (#8), y este filtro por severidad. En los tres casos **el instrumento de medición produjo la conclusión**, y en ninguno avisó de que estaba recortando.
+
+La versión aplicada a este dominio es directa y grave: un SOC que filtra su dashboard por `severity >= WARNING` se pierde toda la actividad de reconocimiento, que es en su mayoría NOTICE — y el reconocimiento es lo que precede al resto. Un pipeline de detección que descarta señal por defecto es indistinguible de uno que no detecta.
+
+---
+
+## #10 — La regla de robo de token: alias de rutas, campos truncados y 804 falsos positivos
+
+**Fecha:** 2026-08-18 · **Módulo:** 5 (Falco) · **Estado:** resuelto
+
+### Contexto
+
+Regla propia para detectar lectura del token de Service Account (`/var/run/secrets/kubernetes.io/serviceaccount/token`), el vector clásico para pasar de "ejecución de código en un contenedor" a "acceso al API server con la identidad del pod". Es un caso que **el admission control no puede cubrir**: el token está montado legítimamente por el kubelet y leerlo es una operación normal para cualquier SDK. Solo se distingue por comportamiento.
+
+Aparecieron tres problemas distintos, en tres capas distintas.
+
+### Problema 1 — Alias de rutas: dos caminos al mismo archivo
+
+La condición original usaba `fd.name startswith "/var/run/secrets/kubernetes.io/serviceaccount/"`.
+
+Se detectó que la ruta del montaje difiere según la imagen:
+
+```
+busybox:1.37        /var/run es directorio real   →  /var/run/secrets/kubernetes.io/serviceaccount
+nginx:1.29-alpine   /var/run → ../run (symlink)   →  /run/secrets/kubernetes.io/serviceaccount
+```
+
+Mismo `mountPath` en la spec del pod, mismo kubelet, y el kernel los monta en rutas distintas porque el runtime resuelve el symlink de la imagen antes de crear el punto de montaje.
+
+**Corrección de un diagnóstico intermedio erróneo.** Se concluyó de ahí que la regla detectaría el robo en el pod busybox y no en el pod nginx. Verificado después, eso era falso: `fd.name` reporta **la ruta tal como el proceso la abrió**, no el punto de montaje resuelto, así que `cat /var/run/...` en el pod alpine también matchea.
+
+Pero la corrección seguía siendo necesaria, por un motivo más serio: **el atacante elige la ruta**. Comprobado directamente:
+
+```
+cat /var/run/secrets/.../token  →  fd.name = /var/run/secrets/.../token
+cat /run/secrets/.../token      →  fd.name = /run/secrets/.../token      ← mismo pod
+```
+
+Con la regla original, el segundo comando pasaba invisible. No es un problema de qué imagen se usa, es que **dos rutas distintas llevan al mismo archivo y una detección basada en path tiene que enumerarlas todas**: la clase de evasión por aliasing de rutas.
+
+Solución, con el operador `pmatch` de Falco, que entiende jerarquía de directorios en lugar de comparar cadenas:
+
+```yaml
+and fd.name pmatch (/var/run/secrets/kubernetes.io/serviceaccount, /run/secrets/kubernetes.io/serviceaccount)
+```
+
+### Problema 2 — El output template define el esquema de datos
+
+Al intentar afinar la regla, los campos de proceso venían vacíos:
+
+```
+proc.name → null    proc.pname → null    proc.tty → null
+proc.cmdline → "cat /var/run/secrets/..."    ← este sí
+```
+
+**Falco solo incluye en el JSON los campos referenciados en la plantilla `output`.** `proc.cmdline` estaba porque figuraba en el template; los demás no existían en el evento.
+
+La consecuencia va más allá del debugging: **no se puede filtrar en un SIEM por un campo que nunca se emitió**. El `output` no es cosmética, es la definición del esquema. Si falta un campo, hay que modificar la regla y esperar a que el evento vuelva a ocurrir.
+
+De ahí la regla de orden: **primero la visibilidad, después el afinado.** No se afina lo que no se ve.
+
+### Problema 3 — 804 alertas, 2 reales
+
+Con los campos visibles, el volumen quedó a la vista:
+
+```
+804 alertas totales
+  579  namespace kyverno
+  222  namespace kube-system
+    3  namespace demo    ← 2 son los ataques simulados
+```
+
+Señal/ruido: **0,25%**. Una regla técnicamente correcta y operativamente inútil: nadie encuentra esas dos líneas.
+
+El discriminador salió de medir, no de suponer:
+
+```
+8 reports-control     ← binarios de las apps leyendo su propio token para autenticarse
+6 kyverno
+5 background-cont
+4 cleanup-control
+2 metrics-server
+1 traefik
+1 cat                 ← el ataque
+```
+
+**Hallazgo colateral: `proc.name` se trunca a 15 caracteres.** Viene del campo `comm` del kernel, que tiene ese límite duro — de ahí `reports-control` y `background-cont`. Un filtro por `proc.name = "background-controller"` no habría matcheado nunca, produciendo el cuarto fallo silencioso del proyecto. Para nombres largos corresponde `proc.exepath`.
+
+**Y el contraejemplo, en la otra dirección:** en Alpine `cat` es un symlink a busybox, así que el mismo ataque reporta `proc.name=cat` pero `proc.exepath=/bin/busybox`. Un filtro por `proc.exepath in (/bin/cat)` se habría perdido ese pod. Ninguno de los dos campos es universalmente correcto: `proc.name` se trunca, `proc.exepath` colapsa los binarios multi-llamada. Hay que saber de qué fallo se está cuidando cada regla.
+
+Solución aplicada — filtrar por quién lee, no por dónde:
+
+```yaml
+- list: token_reader_tools
+  items: [cat, head, tail, more, less, base64, xxd, od, strings, curl, wget, nc, socat, tar, cp, dd]
+
+- macro: suspicious_token_reader
+  condition: (proc.name in (token_reader_tools) or proc.name in (shell_binaries))
+```
+
+Resultado: **de 804 alertas a 1**, conservando la detección en las dos imágenes.
+
+Se descartó explícitamente la alternativa de excluir por namespace (`not k8s.ns.name in (kube-system, kyverno)`): es más simple y peor, porque vuelve invisible a un atacante que consiga ejecución en `kube-system`, que es justamente donde más costaría.
+
+### Limitación declarada
+
+La regla filtra por nombre de proceso, así que **no detecta a un atacante que lea el token desde su propio binario** (un implant en Go, Python o similar). Cubre el acceso oportunista con herramientas de línea de comandos, no al adversario preparado. Queda escrito en el `desc` de la regla: un `desc` honesto sobre los límites vale más que uno que promete cobertura total.
+
+### Aprendizaje
+
+**Afinar es la mitad del trabajo, y se hace con datos.** El discriminador correcto no se adivina: se emite el campo, se mide la distribución y se decide sobre la evidencia. Las dos hipótesis que se plantearon antes de medir (que el ruido venía de los binarios de las apps, y que el problema del symlink afectaba por imagen) resultaron una correcta y una equivocada.
+
+**Una detección sin afinar no es una detección a medias, es ninguna.** 804 eventos con 2 verdaderos positivos no se triagean: se ignoran. Y una regla que se ignora es peor que no tenerla, porque genera la sensación de estar cubierto.

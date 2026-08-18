@@ -14,12 +14,12 @@ El objetivo del repositorio no es demostrar que el stack levanta, sino documenta
 | 1 | Dos VMs Debian 13 provisionadas con cloud-init | ✅ Completo |
 | 2 | Cluster k3s: control plane + nodo de trabajo | ✅ Completo |
 | 3 | Fundamentos: Namespace, Deployment, Service, labels | ✅ Completo |
-| 4 | Kyverno: admission control y políticas | 🔨 En curso |
-| 5 | Falco: detección en runtime con eBPF | ⬜ Pendiente |
+| 4 | Kyverno: admission control y políticas | ✅ Completo |
+| 5 | Falco: detección en runtime con eBPF | ✅ Completo |
 | 6 | Falcosidekick → Elasticsearch → Kibana | ⬜ Pendiente |
 | 7 | Documentación final y diagramas | ⬜ Pendiente |
 
-**Pendiente conocido:** la política de Kyverno tiene un agujero identificado y documentado (initContainer sin tag explícito). Ver [bitácora #8](docs/bitacora.md).
+**Verificado:** la suite de casos negativos de las políticas pasa 5 de 5 ([`tests/`](tests/)), y la regla propia de Falco detecta el robo de token de Service Account en dos imágenes con rutas de montaje distintas, con el ruido afinado de 804 alertas a 1.
 
 ---
 
@@ -210,6 +210,53 @@ kubectl apply -f policies/
 kubectl get clusterpolicy
 ```
 
+Verificar la suite de casos negativos — los cuatro primeros deben ser rechazados y el quinto aceptado:
+
+```bash
+kubectl apply -f tests/ -n demo --dry-run=server
+```
+
+### 8. Falco
+
+Toda la configuración vive en [`falco/values.yaml`](falco/values.yaml): el driver, el formato de salida y las reglas propias.
+
+```bash
+helm repo add falcosecurity https://falcosecurity.github.io/charts && helm repo update
+helm install falco falcosecurity/falco -n falco --create-namespace -f falco/values.yaml
+kubectl rollout status daemonset/falco -n falco
+```
+
+Para actualizar tras editar el values file, **sin `--reuse-values`** (el archivo ya contiene la configuración completa):
+
+```bash
+helm upgrade falco falcosecurity/falco -n falco -f falco/values.yaml
+helm list -n falco      # verificar que la REVISION subió
+```
+
+Confirmar que cargó el driver correcto — tiene que aparecer `Opening 'syscall' source with modern BPF probe`:
+
+```bash
+kubectl logs -n falco -l app.kubernetes.io/name=falco --tail=40 | grep -i "BPF probe"
+```
+
+`driver.kind: modern_ebpf` usa eBPF con **CO-RE** (*Compile Once, Run Everywhere*): el programa viene precompilado y se adapta al kernel local leyendo el BTF en `/sys/kernel/btf/vmlinux`. Sin BTF habría que compilar un módulo contra los headers de cada nodo, e instalar toolchains de compilación en nodos de producción es justamente lo que no se quiere.
+
+**Probarlo con una intrusión simulada:**
+
+```bash
+kubectl run intruso --image=busybox:1.37 -n demo -- sleep 3600
+kubectl exec -it intruso -n demo -- sh
+# adentro:  cat /etc/shadow  y  cat /var/run/secrets/kubernetes.io/serviceaccount/token
+```
+
+Y ver las alertas **sin filtrar por severidad** — filtrar por `warning` esconde las reglas `NOTICE`, que son la mayoría de la actividad de reconocimiento:
+
+```bash
+kubectl logs -n falco -l app.kubernetes.io/name=falco --tail=200 \
+  | grep '"rule":' \
+  | jq -r '.priority + " | " + .rule + " | " + (.output_fields["k8s.pod.name"] // "-")'
+```
+
 ---
 
 ## Decisiones de seguridad
@@ -243,14 +290,20 @@ Si vas a leer una sola cosa, leé la [bitácora](docs/bitacora.md). Ocho inciden
 
 **Una política de admisión que pasaba su propia prueba y se podía evadir de dos formas.** Bloqueaba `nginx:latest` correctamente. Pero solo validaba `spec.containers`, dejando libres `initContainers` y `ephemeralContainers`; y como buscaba la cadena `:latest`, una imagen sin tag —que el runtime resuelve a `latest` igual— pasaba limpia. Al reescribirla, un error de capitalización (`initcontainers` en lugar de `initContainers`) hizo que la validación se **salteara en silencio**, en una política que reportaba `Ready`.
 
+**Una regla de detección correcta y, tal como estaba, inservible.** La regla propia de robo de token de Service Account funcionaba: detectaba el ataque. También generaba **804 alertas con 2 verdaderos positivos** — un 0,25% de señal, porque todo componente de Kubernetes lee su propio token para autenticarse. Afinarla exigió antes arreglar la visibilidad (Falco solo emite en el JSON los campos que la plantilla `output` referencia, así que los campos de proceso venían vacíos), y trajo dos hallazgos sobre los campos disponibles: `proc.name` se trunca a 15 caracteres porque viene del `comm` del kernel, y `proc.exepath` colapsa los binarios multi-llamada — en Alpine `cat` reporta `/bin/busybox`. Ninguno de los dos sirve para todo.
+
+**Un patrón que se repitió cuatro veces.** El instrumento de medición produciendo la conclusión: un `head -5` que llevó a afirmar que no había servidor DHCP cuando sí lo había, un `grep -i warning` que ocultó una detección de prioridad `NOTICE`, un caso de prueba que no cubría la intersección de dos condiciones, y un error de capitalización que hacía que una validación se salteara sin fallar. Ninguno de los cuatro avisó de que estaba recortando.
+
 ---
 
 ## Roadmap
 
-- [ ] Cerrar el agujero pendiente de la política y versionar los casos negativos en `tests/`
-- [ ] Integrar `kyverno test` en CI para que ningún cambio de política pueda abrir un agujero sin que falle el pipeline
+- [x] Políticas de Kyverno con casos negativos versionados en `tests/`
+- [x] Falco con modern eBPF, regla propia y validación con eventos reales
+- [ ] Migrar `tests/` a `kyverno test` para correrlo en CI: con `kubectl apply --dry-run` el exit code queda invertido para casos negativos
 - [ ] Políticas de Pod Security: `runAsNonRoot`, `readOnlyRootFilesystem`, prohibir `privileged` y `hostPath`
-- [ ] Falco con modern eBPF, reglas propias y validación con eventos reales
 - [ ] Falcosidekick → Elasticsearch, con dashboards de Kibana
 - [ ] Diagrama de arquitectura y modelo de amenazas
+- [ ] Scripts `infra/lab-up.sh` y `lab-down.sh` para levantar y bajar el lab
 - [ ] Evaluar IPs estáticas vía `network-config` en la semilla NoCloud
+- [ ] *(candidato)* GitOps con Argo CD o Flux, que elimina por diseño el desfase entre lo declarado en el repo y lo aplicado en el cluster

@@ -1,0 +1,28 @@
+driver:
+  kind: modern_ebpf
+tty: true
+falco:
+  json_output: true
+
+customRules:
+  custom-rules.yaml: |-
+    - rule: Detect Service Account Token Read
+      desc: >
+        Detecta lectura del token de Service Account desde shells o herramientas de
+        línea de comandos dentro de un contenedor, vector clásico de movimiento lateral
+        usando la identidad del pod.
+        LIMITACION CONOCIDA: no detecta a un atacante que lea el token desde su propio
+        binario (implant en Go, Python, etc.), porque el filtro es por nombre de proceso.
+      condition: >
+        open_read and container and fd.name pmatch (/var/run/secrets/kubernetes.io/serviceaccount, /run/secrets/kubernetes.io/serviceaccount) and suspicious_token_reader
+      output: >
+        Lectura del token de Service Account (namespace=%k8s.ns.name pod=%k8s.pod.name
+        container=%container.name image=%container.image.repository user=%user.name
+        process=%proc.name parent=%proc.pname exepath=%proc.exepath tty=%proc.tty
+        cmdline=%proc.cmdline file=%fd.name)
+      priority: WARNING
+      tags: [container, k8s, mitre_credential_access, T1552.001]
+    - list: token_reader_tools
+      items: [cat, head, tail, more, less, base64, xxd, od, strings, curl, wget, nc, socat, tar, cp, dd]
+    - macro: suspicious_token_reader
+      condition: (proc.name in (token_reader_tools) or proc.name in (shell_binaries))
