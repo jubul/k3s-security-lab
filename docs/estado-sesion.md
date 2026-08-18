@@ -2,8 +2,8 @@
 
 > Documento de handoff. Se actualiza al cerrar cada módulo para poder retomar sin recontextualizar.
 
-**Última actualización:** 2026-08-17, 18:30 — Módulos 0, 1 y 2 completos. Cluster operativo.
-**Módulo en curso:** 3 (fundamentos de Kubernetes).
+**Última actualización:** 2026-08-17, cierre de la primera sesión (~16:30 a 20:00). Módulos 0 a 3 completos, módulo 4 en curso.
+**Módulo en curso:** 4 (Kyverno) — con un agujero de política pendiente de cerrar, ver más abajo.
 
 **Cluster:** k3s v1.36.3+k3s1, containerd 2.3.2-k3s2, 2 nodos `Ready`. Componentes en `kube-system`: CoreDNS, Traefik (+ svclb como DaemonSet), metrics-server, local-path-provisioner. `kubectl` y `helm` instalados en el host, kubeconfig en `~/.kube/config` (modo 600, apuntando a `192.168.122.6`).
 
@@ -74,8 +74,8 @@ Lab de seguridad en Kubernetes, documentado para publicar en GitHub. Doble prop�
 | 0 | Prerequisitos KVM/libvirt | **Completo** |
 | 1 | Dos VMs Debian 13 con cloud-init | **Completo** |
 | 2 | k3s: server + agent join, kubeconfig al host | **Completo** |
-| 3 | Fundamentos k8s (pod, deployment, service, namespace, RBAC) | **En curso** |
-| 4 | Kyverno: admission control y políticas | Pendiente |
+| 3 | Fundamentos k8s (namespace, deployment, service, labels) | **Completo** |
+| 4 | Kyverno: admission control y políticas | **En curso** |
 | 5 | Falco: modern eBPF y reglas custom | Pendiente |
 | 6 | ELK + Falcosidekick: pipeline de alertas y dashboards | Pendiente |
 | 7 | Repo y documentación final | Pendiente |
@@ -115,6 +115,48 @@ Ejecutada por SSH en ambos nodos, todo OK:
 - `br_netfilter` no está cargado en el host, por lo que el tráfico entre VMs del mismo bridge no pasa por netfilter. Por eso el join al 6443 y el VXLAN de flannel (UDP 8472) funcionan sin reglas de ufw.
 - Se agregó `--tls-san 192.168.122.6` al server: sin esa SAN en el certificado, el acceso al API desde el host por IP falla la validación TLS.
 
-## Próximo paso al retomar
+## Notas del Módulo 3 (completo)
 
-**Módulo 3:** fundamentos de Kubernetes con las manos — explorar el cluster con `kubectl`, y escribir Namespace, Deployment y Service. Los incidentes ya resueltos están en `bitacora.md` (6 entradas).
+Escritos y aplicados en `manifests/`: Namespace `demo`, Deployment `web` (2 réplicas de `nginx:1.29-alpine` con requests/limits) y Service `web` de tipo ClusterIP. Revisados sin observaciones.
+
+Conceptos verificados con las manos:
+- **Reconciliación:** al borrar un pod a mano, el ReplicaSet crea el reemplazo. Nadie "reinicia" nada; un controlador nota la diferencia entre estado deseado y real.
+- **Labels como cableado:** al cambiar `app=web` por `app=roto` en un pod, este desaparece del EndpointSlice y el ReplicaSet crea otro. Las relaciones en Kubernetes son consultas sobre etiquetas, no punteros.
+- El scheduler repartió un pod por nodo. Flannel asigna una subred por nodo: `10.42.0.0/24` al server, `10.42.1.0/24` al agent.
+- La label `pod-template-hash` la agrega el ReplicaSet; es el hash que aparece en el nombre de los pods y el mecanismo de las actualizaciones graduales.
+
+## Notas del Módulo 4 (en curso)
+
+**Instalado:** Kyverno v1.18.2 vía Helm, cuatro controladores (admission, background, reports, cleanup) con una réplica cada uno por restricción de RAM.
+
+**Escrito:** `policies/01-disallow-latest-tag.yaml`, una ClusterPolicy con dos reglas (`require-image-tag` y `validate-image-tag`) cubriendo `containers`, `initContainers` y `ephemeralContainers`.
+
+Aprendizajes de la API que conviene no olvidar:
+- En Kyverno 1.18.2 `failureAction` va **a nivel de regla** (`spec.rules[].validate.failureAction`), no a nivel de spec. El campo legacy `spec.validationFailureAction` sigue existiendo y muestra su default `Audit`, lo que resulta contradictorio al inspeccionar el objeto: **manda el de la regla**.
+- El *conditional anchor* `=(campo)` significa "si este campo existe, validalo". Sin él, un Pod sin `initContainers` fallaría por no declarar un campo que no le corresponde.
+- **Autogen:** Kyverno genera solo las variantes de cada regla para controladores de pods (Deployment, DaemonSet, StatefulSet, Job, CronJob), con el prefijo `autogen-`. Sin eso el rechazo llegaría al crear el pod y el error quedaría en eventos en lugar de volver al `apply`.
+
+### ⚠️ Agujero abierto — primera tarea al retomar
+
+`policies/01-disallow-latest-tag.yaml` **línea 19**: dice `=(initcontainers)` (minúscula) y debe decir `=(initContainers)` (camelCase). Está corregido en la regla 2 y no en la regla 1.
+
+Efecto verificado: un initContainer **sin tag** pasa la validación. Los demás casos bloquean bien.
+
+```
+container con latest        →  BLOQUEADO
+container sin tag           →  BLOQUEADO
+initContainer con latest    →  BLOQUEADO
+initContainer sin tag       →  PASA        ← el agujero
+pod correcto                →  PASA        (sin falsos positivos)
+```
+
+Corrección secundaria: los dos `message` dicen `nginx-1.29-alpine` con guión; va con dos puntos, `nginx:1.29-alpine`. En un mensaje cuyo objetivo es enseñar a poner el tag, el ejemplo mal escrito desorienta.
+
+## Próximos pasos al retomar
+
+1. **Corregir la línea 19** de la política y reverificar los cinco casos.
+2. **Crear `tests/`** con un archivo por caso negativo (los cinco de la tabla de arriba), ejecutables juntos con `kubectl apply -f tests/ --dry-run=server`. Nota: la shell del entorno es **fish**, que no soporta heredocs de bash — los casos van como archivos, no como comandos.
+3. **Commitear**, que el repositorio todavía no tiene ningún commit.
+4. Seguir con más políticas de Pod Security (`runAsNonRoot`, `readOnlyRootFilesystem`, prohibir `privileged` y `hostPath`) y después el **Módulo 5: Falco**.
+
+Los ocho incidentes resueltos están documentados en `bitacora.md` con causa raíz y evidencia.

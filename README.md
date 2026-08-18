@@ -1,0 +1,256 @@
+# k3s Security Lab
+
+Laboratorio de seguridad en Kubernetes construido desde cero sobre VMs KVM: cluster **k3s** multi-nodo con **admission control** (Kyverno), **detección en runtime** (Falco) y **centralización de alertas** en Elasticsearch/Kibana.
+
+El objetivo del repositorio no es demostrar que el stack levanta, sino documentar **cómo se razonó cada decisión y cada fallo**. Todo el diagnóstico de los problemas encontrados está en [`docs/bitacora.md`](docs/bitacora.md), con causa raíz y evidencia — incluidos los errores propios.
+
+---
+
+## Estado actual
+
+| # | Módulo | Estado |
+|---|--------|--------|
+| 0 | Prerequisitos KVM/libvirt en el host | ✅ Completo |
+| 1 | Dos VMs Debian 13 provisionadas con cloud-init | ✅ Completo |
+| 2 | Cluster k3s: control plane + nodo de trabajo | ✅ Completo |
+| 3 | Fundamentos: Namespace, Deployment, Service, labels | ✅ Completo |
+| 4 | Kyverno: admission control y políticas | 🔨 En curso |
+| 5 | Falco: detección en runtime con eBPF | ⬜ Pendiente |
+| 6 | Falcosidekick → Elasticsearch → Kibana | ⬜ Pendiente |
+| 7 | Documentación final y diagramas | ⬜ Pendiente |
+
+**Pendiente conocido:** la política de Kyverno tiene un agujero identificado y documentado (initContainer sin tag explícito). Ver [bitácora #8](docs/bitacora.md).
+
+---
+
+## Arquitectura
+
+```
+        HOST (CachyOS · 16 cores · 15 GB RAM)
+        kubectl · helm · navegador → Kibana
+        ufw activo, con reglas explícitas para el lab
+                        │
+              virbr0 — NAT libvirt — 192.168.122.0/24
+                        │
+        ┌───────────────┴────────────────┐
+        │                                │
+┌───────────────────┐          ┌───────────────────┐
+│    k3s-server     │          │     k3s-agent     │
+│  192.168.122.6    │◄────────►│  192.168.122.128  │
+│   3 GB · 2 vCPU   │  flannel │   6 GB · 4 vCPU   │
+│                   │  VXLAN   │                   │
+│  control plane    │          │  Elasticsearch    │
+│  Kyverno          │          │  Kibana           │
+│  Falco (DaemonSet)│          │  Falco (DaemonSet)│
+└───────────────────┘          └───────────────────┘
+   Debian 13.6 · kernel 6.12 · arranque UEFI · BTF presente
+```
+
+Falco corre como **DaemonSet**: una instancia por nodo, cada una observando las syscalls de su propio kernel.
+
+---
+
+## Stack y por qué
+
+| Componente | Elección | Motivo |
+|---|---|---|
+| Cluster | **k3s** | Un binario con todo el control plane. Certificado por CNCF y usado en producción en edge, no un juguete. |
+| Infraestructura | **libvirt/KVM** | Kernels reales por nodo. Falco observa syscalls: en contenedores compartiendo el kernel del host las reglas no se comportan como en producción. |
+| Guest | **Debian 13 genericcloud** | Imagen mínima solo con virtio. Kernel 6.12 con `CONFIG_DEBUG_INFO_BTF=y`, requisito para eBPF sin compilar módulos. |
+| Provisioning | **cloud-init (NoCloud)** | Nodos reproducibles desde YAML versionado, sin instalación manual. |
+| Admission control | **Kyverno** | Las políticas son objetos de Kubernetes en YAML: se versionan en git y se explican sin traducir un lenguaje aparte. OPA/Gatekeeper tiene más poder y bastante más curva. |
+| Runtime security | **Falco** | Estándar CNCF para detección basada en syscalls. |
+| Alertas | **Falcosidekick + ELK** | Falco detecta; el pipeline convierte la detección en algo consultable e histórico. |
+
+### Prevención y detección son capas distintas
+
+El proyecto combina deliberadamente dos enfoques complementarios:
+
+- **Kyverno actúa en la puerta.** Un pod rechazado en admission nunca ejecutó una línea de código. Es prevención, y solo alcanza para lo que se puede decidir mirando el manifest.
+- **Falco actúa adentro.** Un contenedor legítimo que a las tres semanas abre una shell inesperada o lee `/etc/shadow` pasó todos los controles de admisión. Eso solo se ve observando comportamiento.
+
+Ninguna de las dos capas reemplaza a la otra, y esa es la tesis del lab.
+
+---
+
+## Estructura del repositorio
+
+```
+├── docs/
+│   ├── bitacora.md         Incidentes con diagnóstico y causa raíz
+│   └── estado-sesion.md    Estado de avance y punto de retomada
+├── infra/
+│   └── cloud-init/         user-data y meta-data de cada nodo (NoCloud)
+├── manifests/              Objetos de Kubernetes de la app de ejemplo
+├── policies/               ClusterPolicies de Kyverno
+└── tests/                  Casos negativos de las políticas (en construcción)
+```
+
+---
+
+## Reproducirlo
+
+Requiere un host Linux con virtualización por hardware (`vmx` o `svm`), ~10 GB de RAM libre y 45 GB de disco.
+
+### 1. Host: virtualización
+
+```bash
+sudo pacman -S --needed qemu-desktop libvirt virt-install dnsmasq openbsd-netcat libisoburn
+sudo systemctl enable --now libvirtd.socket
+sudo usermod -aG libvirt $USER      # requiere volver a iniciar sesión
+sudo virsh net-start default && sudo virsh net-autostart default
+```
+
+En fish, para no repetir `-c qemu:///system` en cada comando:
+
+```fish
+set -Ux LIBVIRT_DEFAULT_URI qemu:///system
+```
+
+### 2. Firewall del host
+
+Si usás `ufw`, sin estas reglas los guests no obtienen IP ni salida a internet ([bitácora #6](docs/bitacora.md)):
+
+```bash
+sudo ufw allow in on virbr0 to any port 67 proto udp comment 'libvirt DHCP'
+sudo ufw allow in on virbr0 to any port 53 comment 'libvirt DNS'
+sudo ufw route allow in on virbr0 out on <interfaz-de-salida> comment 'k3s lab egress'
+sudo ufw reload
+```
+
+### 3. Imagen base y discos
+
+```bash
+cd /tmp
+curl -LO https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2
+curl -LO https://cloud.debian.org/images/cloud/trixie/latest/SHA512SUMS
+sha512sum --ignore-missing -c SHA512SUMS      # verificar antes de ejecutar
+sudo mv debian-13-genericcloud-amd64.qcow2 /var/lib/libvirt/images/
+
+cd /var/lib/libvirt/images
+sudo qemu-img create -f qcow2 -F qcow2 -b debian-13-genericcloud-amd64.qcow2 k3s-server.qcow2 20G
+sudo qemu-img create -f qcow2 -F qcow2 -b debian-13-genericcloud-amd64.qcow2 k3s-agent.qcow2 20G
+```
+
+Los discos son overlays copy-on-write: arrancan en ~200 KB. **La imagen base no debe modificarse ni borrarse**, o se corrompen los dos nodos.
+
+### 4. Semillas de cloud-init
+
+```bash
+cd infra/cloud-init
+mkdir -p seed/server seed/agent
+cp user-data-server.yaml seed/server/user-data
+cp user-data-agent.yaml  seed/agent/user-data
+printf 'instance-id: k3s-server-01\nlocal-hostname: k3s-server\n' > seed/server/meta-data
+printf 'instance-id: k3s-agent-01\nlocal-hostname: k3s-agent\n'  > seed/agent/meta-data
+
+xorrisofs -output /tmp/seed-server.iso -volid cidata -joliet -rock seed/server
+xorrisofs -output /tmp/seed-agent.iso  -volid cidata -joliet -rock seed/agent
+sudo mv /tmp/seed-*.iso /var/lib/libvirt/images/
+```
+
+Reemplazá la clave pública en los `user-data-*.yaml` por la tuya. El contrato de NoCloud es estricto: etiqueta de volumen `cidata` y archivos llamados exactamente `user-data` y `meta-data`, sin extensión.
+
+### 5. Las VMs
+
+```bash
+sudo virt-install \
+  --name k3s-server --memory 3072 --vcpus 2 --cpu host-passthrough \
+  --boot uefi \
+  --disk /var/lib/libvirt/images/k3s-server.qcow2,format=qcow2,bus=virtio \
+  --disk /var/lib/libvirt/images/seed-server.iso,device=cdrom \
+  --osinfo debian13 --network network=default,model=virtio \
+  --graphics none --console pty,target_type=serial --import
+```
+
+Ídem para el agent con 6144 MB, 4 vCPU y sus propios archivos.
+
+⚠️ **`--boot uefi` es obligatorio.** Con arranque BIOS (SeaBIOS) los guests no arrancan: el firmware entra en un ciclo de reintentos y la VM queda ejecutándose sin llegar nunca al kernel ([bitácora #5](docs/bitacora.md)).
+
+⚠️ **No usar `--cloud-init` de `virt-install`.** Combinado con `--noautoconsole` aborta el primer arranque y descarta la ISO de semilla ([bitácora #4](docs/bitacora.md)). De ahí que la semilla se construya a mano en el paso 4.
+
+### 6. k3s
+
+En el server:
+
+```bash
+curl -sfL https://get.k3s.io | sudo sh -s - server \
+  --node-ip 192.168.122.6 --tls-san 192.168.122.6
+sudo cat /var/lib/rancher/k3s/server/node-token
+```
+
+En el agent:
+
+```bash
+curl -sfL https://get.k3s.io | sudo \
+  K3S_URL=https://192.168.122.6:6443 K3S_TOKEN='<token>' \
+  sh -s - agent --node-ip 192.168.122.128
+```
+
+En el host:
+
+```bash
+sudo pacman -S --needed kubectl helm
+mkdir -p ~/.kube
+ssh jubul@192.168.122.6 'sudo cat /etc/rancher/k3s/k3s.yaml' > ~/.kube/config
+chmod 600 ~/.kube/config
+sed -i 's|127.0.0.1|192.168.122.6|' ~/.kube/config
+kubectl get nodes -o wide
+```
+
+### 7. Kyverno
+
+```bash
+helm repo add kyverno https://kyverno.github.io/kyverno/ && helm repo update
+helm install kyverno kyverno/kyverno -n kyverno --create-namespace \
+  --set admissionController.replicas=1 --set backgroundController.replicas=1 \
+  --set cleanupController.replicas=1 --set reportsController.replicas=1
+
+kubectl apply -f policies/
+kubectl get clusterpolicy
+```
+
+---
+
+## Decisiones de seguridad
+
+Decisiones tomadas deliberadamente, con su justificación:
+
+- **El kubeconfig se copia por SSH con `sudo cat`, no con `--write-kubeconfig-mode 644`.** Ese archivo es la credencial de administrador del cluster; aflojarle los permisos para ahorrar un `sudo` sería incoherente con el objetivo del proyecto. Queda en modo `600`.
+- **`ufw` se mantiene activo.** Desactivarlo resolvía el problema de DHCP en un comando. En su lugar se agregaron reglas mínimas, comentadas y documentadas.
+- **La imagen base se verifica con SHA512 antes de ejecutarla.** Verificar el artefacto que vas a correr es el punto de partida, no un trámite.
+- **No se crea el usuario `debian` por defecto de la imagen.** Al declarar `users:` en cloud-init se reemplaza la lista por defecto: menos cuentas, menos superficie.
+- **Imágenes con tag explícito y fijo, nunca `latest`.** Enforzado por política, no por convención.
+- **El `node-token` de k3s es una credencial.** Quien lo tenga puede sumar nodos al cluster, es decir ejecutar cargas en él. No debe llegar al repositorio.
+
+### Lo que este lab **no** es
+
+Es un entorno de aprendizaje, no una referencia de producción. Limitaciones conscientes:
+
+- Control plane de un solo nodo con SQLite, sin alta disponibilidad.
+- Claves SSH sin passphrase y `sudo` sin contraseña en los nodos.
+- Todos los controladores de Kyverno con una réplica, por restricción de RAM.
+- Elasticsearch sin autenticación ni TLS entre componentes (pendiente de revisar en el módulo 6).
+- Los nodos toman IP por DHCP: pueden cambiar si se recrean las VMs.
+
+---
+
+## Lo más interesante del proyecto
+
+Si vas a leer una sola cosa, leé la [bitácora](docs/bitacora.md). Ocho incidentes con su diagnóstico completo. Dos ejemplos:
+
+**Un guest que ejecutaba código sin arrancar nunca.** Las VMs figuraban en ejecución, consumían CPU y leían 3,37 GB de disco, pero no escribían un byte ni transmitían un paquete. Con el archivo de disco bloqueado por la VM en ejecución, el diagnóstico salió de los contadores del hipervisor y del monitor de QEMU: los registros del vCPU mostraban `CS=f000` en modo real de 16 bits, o sea código de BIOS. Diez minutos después del arranque el control nunca había pasado al kernel.
+
+**Una política de admisión que pasaba su propia prueba y se podía evadir de dos formas.** Bloqueaba `nginx:latest` correctamente. Pero solo validaba `spec.containers`, dejando libres `initContainers` y `ephemeralContainers`; y como buscaba la cadena `:latest`, una imagen sin tag —que el runtime resuelve a `latest` igual— pasaba limpia. Al reescribirla, un error de capitalización (`initcontainers` en lugar de `initContainers`) hizo que la validación se **salteara en silencio**, en una política que reportaba `Ready`.
+
+---
+
+## Roadmap
+
+- [ ] Cerrar el agujero pendiente de la política y versionar los casos negativos en `tests/`
+- [ ] Integrar `kyverno test` en CI para que ningún cambio de política pueda abrir un agujero sin que falle el pipeline
+- [ ] Políticas de Pod Security: `runAsNonRoot`, `readOnlyRootFilesystem`, prohibir `privileged` y `hostPath`
+- [ ] Falco con modern eBPF, reglas propias y validación con eventos reales
+- [ ] Falcosidekick → Elasticsearch, con dashboards de Kibana
+- [ ] Diagrama de arquitectura y modelo de amenazas
+- [ ] Evaluar IPs estáticas vía `network-config` en la semilla NoCloud

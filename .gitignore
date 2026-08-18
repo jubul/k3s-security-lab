@@ -1,0 +1,23 @@
+# Imágenes y artefactos de disco — se reconstruyen, no se versionan
+*.iso
+*.qcow2
+*.img
+*.fd
+
+# Credenciales — nunca al repositorio
+kubeconfig
+*.kubeconfig
+node-token
+*.key
+*.pem
+id_ed25519
+id_rsa
+secrets/
+
+# Semillas de cloud-init generadas: las fuentes son infra/cloud-init/user-data-*.yaml
+infra/cloud-init/seed/
+
+# Temporales
+*.swp
+*~
+.DS_Store

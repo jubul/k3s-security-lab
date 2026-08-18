@@ -366,3 +366,133 @@ Los clientes DHCP de los guests ya habían agotado sus reintentos, así que hubo
 **"Nadie logueó nada" es una señal, no una ausencia de señal.** Que dnsmasq no tuviera una sola entrada fue más informativo que cualquier mensaje de error: descartó de un golpe todo el procesamiento del servidor y movió la búsqueda aguas arriba, a la capa de filtrado.
 
 **Se mantuvo el firewall activo.** Desactivar ufw habría resuelto el síntoma en un comando, y habría sido la decisión incorrecta en un proyecto de seguridad. Las reglas quedaron mínimas, con comentarios y documentadas.
+
+---
+
+## #7 — La política de Kyverno que funcionaba y se podía evadir de dos formas
+
+**Fecha:** 2026-08-17 · **Módulo:** 4 (Kyverno) · **Estado:** resuelto parcialmente (ver #8)
+
+### Síntoma
+
+No hubo síntoma. Ese es el punto de esta entrada.
+
+La primera versión de la política que prohíbe el tag `latest` se aplicó sin errores, quedó `Ready`, y bloqueó correctamente el caso de prueba:
+
+```
+kubectl run malo --image=nginx:latest -n demo
+Error from server: admission webhook "validate.kyverno.svc-fail" denied the request
+```
+
+Todo indicaba que la política estaba lista.
+
+### Diagnóstico
+
+Se probaron casos negativos que la prueba original no cubría. Dos pasaron:
+
+```
+initContainers con nginx:latest  →  pod created   ← evadida
+image: nginx  (sin tag)          →  pod created   ← evadida
+containers con nginx:latest      →  BLOQUEADO     ← control OK
+```
+
+**Evasión 1 — contenedores no cubiertos.** El `pattern` validaba únicamente `spec.containers`. Un Pod tiene tres listas de contenedores: `containers`, `initContainers` (corren antes que los principales, con acceso a los mismos volúmenes) y `ephemeralContainers` (los inyecta `kubectl debug` en un pod ya en ejecución). Cualquiera con permiso de crear pods podía introducir la imagen que quisiera por las dos listas no validadas.
+
+**Evasión 2 — el tag implícito.** `image: nginx` no contiene la cadena `:latest`, así que el glob `!*:latest` no la matchea. Pero el runtime la resuelve a `nginx:latest` de todos modos. La política cubría el error explícito y dejaba pasar el implícito, que es justamente el que se comete sin darse cuenta.
+
+### Causa raíz
+
+La política se validó contra el caso que se esperaba que fallara, no contra el conjunto de casos que debía cubrir. Una regla de admisión no se prueba demostrando que bloquea lo que quiere bloquear, sino verificando que **no exista camino** para lo que quiere prohibir.
+
+### Solución
+
+Reescritura con **dos reglas** en lugar de una:
+
+1. `require-image-tag` — patrón `"*:*"`: exige tag explícito, cierra la evasión 2.
+2. `validate-image-tag` — patrón `"!*:latest"`: prohíbe `latest`, la validación original.
+
+Y cada regla cubre las tres listas de contenedores, usando el *conditional anchor* de Kyverno:
+
+```yaml
+pattern:
+  spec:
+    containers:
+      - image: "*:*"
+    =(initContainers):
+      - image: "*:*"
+    =(ephemeralContainers):
+      - image: "*:*"
+```
+
+La sintaxis `=(campo)` significa "si este campo existe, validalo". Sin el anchor, un Pod sin `initContainers` fallaría la validación por no declarar un campo que no le corresponde tener, y la política rompería todos los deploys legítimos del cluster.
+
+Hicieron falta dos reglas y no una: las dos validaciones aplican sobre la misma clave (`image`), y en un solo `pattern` YAML no puede haber dos veces la misma clave (ver #8).
+
+### Aprendizaje
+
+**Una política de seguridad se prueba con los casos que deberían fallar, no con los que deberían pasar.** El caso feliz confirma que la regla está instalada; los casos negativos confirman que sirve.
+
+**Enumerar la superficie completa antes de escribir la regla.** Las dos evasiones venían del mismo error: asumir que "el contenedor de un pod" es un solo lugar. Son tres, y dos son las interesantes para un atacante justamente porque se olvidan.
+
+**Observación colateral: autogen.** Kyverno generó automáticamente `autogen-resource-rule`, una variante de la regla para controladores de pods (Deployment, DaemonSet, StatefulSet, Job, CronJob). Sin eso el rechazo ocurriría cuando el ReplicaSet intentara crear el pod, y el error quedaría en eventos en lugar de volver a la terminal de quien hizo el `apply`.
+
+---
+
+## #8 — Tres bugs silenciosos en la política endurecida
+
+**Fecha:** 2026-08-17 · **Módulo:** 4 (Kyverno) · **Estado:** dos resueltos, uno abierto
+
+### Síntoma
+
+La segunda versión de la política, escrita para cerrar las evasiones de #7, tenía tres defectos. Solo uno se manifestó como error visible.
+
+### Diagnóstico
+
+**Bug 1 — nombre inválido (falló ruidosamente).** El objeto se llamaba `ExecutionPolicy`:
+
+```
+The ClusterPolicy "ExecutionPolicy" is invalid: metadata.name: Invalid value:
+"ExecutionPolicy": a lowercase RFC 1123 subdomain must consist of lower case
+alphanumeric characters, '-' or '.'
+```
+
+Los nombres de objetos de Kubernetes son subdominios DNS RFC 1123 y no admiten mayúsculas. No es una convención de estilo: esos nombres terminan formando parte de nombres DNS reales dentro del cluster. Este bug fue el benigno, porque impidió que el archivo se aplicara.
+
+**Bug 2 — clave YAML duplicada (falló en silencio).** Dentro del mismo `pattern` la clave `containers` aparecía dos veces, una con `"*:*"` y otra con `"!*:latest"`. En un mapping YAML una clave repetida no produce error: **la última sobrescribe a la primera**. El chequeo de tag explícito sobre `containers` se descartaba sin aviso.
+
+**Bug 3 — error de capitalización (falló en silencio).** Se escribió `=(initcontainers)` en minúsculas; el campo real de la API es `initContainers`. Combinado con la semántica del anchor, el efecto es particularmente engañoso: `=(campo)` valida *si el campo existe*, y un campo llamado `initcontainers` no existe nunca en un Pod. La regla **no fallaba: se salteaba**.
+
+El escenario peligroso era la suma de 1, 2 y 3. Corrigiendo solo el nombre, la política se habría aplicado, habría reportado `Ready`, habría bloqueado `nginx:latest` en `containers` — y habría dejado los dos agujeros de #7 intactos, con toda la apariencia de estar funcionando.
+
+### Bug residual (abierto)
+
+Tras corregir el nombre y separar las dos reglas, quedó una divergencia entre ellas:
+
+```yaml
+- name: require-image-tag        # regla 1
+      =(initcontainers):         # minúscula  ← sin corregir
+- name: validate-image-tag       # regla 2
+      =(initContainers):         # camelCase  ← corregida
+```
+
+El typo se corrigió en la regla 2 y no en la regla 1, con un efecto muy preciso:
+
+```
+initContainer con latest    →  BLOQUEADO   (lo atrapa la regla 2)
+initContainer SIN tag       →  created     ← agujero abierto
+container con latest        →  BLOQUEADO
+container sin tag           →  BLOQUEADO
+pod correcto                →  created     (sin falsos positivos)
+```
+
+El agujero sobrevive exactamente en la intersección de las dos condiciones: initContainer **y** tag omitido. Pendiente: corregir la línea 19 de `policies/01-disallow-latest-tag.yaml`.
+
+### Aprendizaje
+
+**Los bugs que fallan ruidosamente son los baratos.** De los tres, el único que se manifestó fue el nombre inválido. Los otros dos habrían quedado en el repositorio, en una política declarada `Ready`, con las validaciones desactivadas en silencio.
+
+**Una divergencia por copy-paste entre dos reglas es invisible en la revisión del código.** Las dos reglas *parecen* iguales al leerlas. La única forma de encontrar la diferencia fue el caso de prueba que combinaba las dos condiciones.
+
+**De ahí la decisión de versionar los casos negativos** en `tests/`, un archivo por caso, ejecutables en conjunto con `kubectl apply -f tests/ --dry-run=server`. Y el paso siguiente natural es el CLI `kyverno test`, que declara el resultado esperado de cada caso y corre sin cluster: eso permite meter las políticas en CI y evitar que un pull request mergee una regla que abre un agujero.
+
+**Nota de método:** en esta sesión se instruyó a usar heredocs de bash (`<<'EOF'`) para las pruebas, sintaxis que la shell del entorno (fish) no soporta. El incidente reorientó la solución hacia algo mejor: los casos de prueba como archivos versionados en el repositorio en lugar de comandos escritos en la terminal y perdidos.
