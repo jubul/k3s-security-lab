@@ -1,0 +1,15 @@
+# CASO NEGATIVO — se espera: BLOQUEADO
+#
+# Imagen sin tag en un contenedor principal. No contiene la cadena ":latest",
+# pero el runtime la resuelve a nginx:latest de todos modos: es la evasión
+# implícita, y la más frecuente en la vida real.
+# Regla que debe atraparlo: require-image-tag (patrón "*:*").
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-notag-container
+spec:
+  containers:
+    - name: app
+      image: nginx

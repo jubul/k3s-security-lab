@@ -1,0 +1,24 @@
+# CASO NEGATIVO — se espera: BLOQUEADO
+#
+# Imagen sin tag en un initContainer: la intersección de las dos evasiones.
+# Este es el caso que detectó el bug residual documentado en bitacora.md #8
+# (=(initcontainers) en minúscula en la regla require-image-tag), porque es
+# el único que necesita esa regla Y esa lista de contenedores a la vez.
+#
+# El contenedor principal es deliberadamente válido: si el caso falla, la
+# causa solo puede ser el initContainer.
+#
+# Regla que debe atraparlo: require-image-tag sobre =(initContainers).
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-notag-initcontainer
+spec:
+  initContainers:
+    - name: init
+      image: nginx
+      command: ["true"]
+  containers:
+    - name: app
+      image: nginx:1.29-alpine

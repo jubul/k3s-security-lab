@@ -11,12 +11,12 @@ spec:
               kinds: [Pod]
       validate:
         failureAction: Enforce
-        message: "La imagen debe especificar un tag explicito. Usa una version fija, por ejemplo nginx-1.29-alpine"
+        message: "La imagen debe especificar un tag explicito. Usa una version fija, por ejemplo nginx:1.29-alpine"
         pattern:
           spec:
             containers:
               - image: "*:*"
-            =(initcontainers):
+            =(initContainers):
               - image: "*:*"
             =(ephemeralContainers):
               - image: "*:*"
@@ -27,7 +27,7 @@ spec:
               kinds: [Pod]
       validate:
         failureAction: Enforce
-        message: "La imagen no puede ser latest. Usa una version fija, por ejemplo nginx-1.29-alpine"
+        message: "La imagen no puede ser latest. Usa una version fija, por ejemplo nginx:1.29-alpine"
         pattern:
           spec:
             containers:

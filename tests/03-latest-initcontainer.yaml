@@ -1,0 +1,23 @@
+# CASO NEGATIVO — se espera: BLOQUEADO
+#
+# Tag :latest en un initContainer. Los initContainers corren antes que los
+# principales y con acceso a los mismos volúmenes, así que una política que
+# solo valida spec.containers deja esta vía completamente abierta.
+#
+# El contenedor principal es deliberadamente válido: si el caso falla, la
+# causa solo puede ser el initContainer.
+#
+# Regla que debe atraparlo: validate-image-tag sobre =(initContainers).
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-latest-initcontainer
+spec:
+  initContainers:
+    - name: init
+      image: nginx:latest
+      command: ["true"]
+  containers:
+    - name: app
+      image: nginx:1.29-alpine

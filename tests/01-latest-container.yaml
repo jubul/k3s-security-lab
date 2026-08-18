@@ -1,0 +1,13 @@
+# CASO NEGATIVO — se espera: BLOQUEADO
+#
+# Tag :latest explícito en un contenedor principal.
+# Regla que debe atraparlo: validate-image-tag (patrón "!*:latest").
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-latest-container
+spec:
+  containers:
+    - name: app
+      image: nginx:latest

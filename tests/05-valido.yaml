@@ -1,0 +1,22 @@
+# CASO POSITIVO — se espera: PERMITIDO
+#
+# Todas las imágenes con tag explícito y fijo, en las dos listas de
+# contenedores. Verifica que la política no genere falsos positivos:
+# una regla que bloquea todo es igual de inútil que una que no bloquea nada.
+#
+# Los conditional anchors =(initContainers) y =(ephemeralContainers) existen
+# precisamente para que este caso pase: sin ellos, un Pod que no declara esos
+# campos fallaría la validación por no tener algo que no le corresponde tener.
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-valido
+spec:
+  initContainers:
+    - name: init
+      image: busybox:1.37
+      command: ["true"]
+  containers:
+    - name: app
+      image: nginx:1.29-alpine
