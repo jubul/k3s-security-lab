@@ -1,37 +1,39 @@
 # k3s Security Lab
 
-Laboratorio de seguridad en Kubernetes construido desde cero sobre VMs KVM: cluster **k3s** multi-nodo con **admission control** (Kyverno), **detección en runtime** (Falco) y **centralización de alertas** en Elasticsearch/Kibana.
+***English** · [Español](README.es.md)*
 
-El objetivo del repositorio no es demostrar que el stack levanta, sino documentar **cómo se razonó cada decisión y cada fallo**. Todo el diagnóstico de los problemas encontrados está en [`docs/bitacora.md`](docs/bitacora.md), con causa raíz y evidencia — incluidos los errores propios.
+A Kubernetes security lab built from scratch on KVM virtual machines: a multi-node **k3s** cluster with **admission control** (Kyverno), **runtime detection** (Falco), and **alert centralization** in Elasticsearch/Kibana.
+
+The point of this repository isn't to show that the stack comes up. It's to document **how every decision and every failure was reasoned through**. The full diagnosis of each problem encountered lives in [`docs/journal.md`](docs/journal.md), with root cause and evidence — including my own mistakes.
 
 ---
 
-## Estado actual
+## Current status
 
-| # | Módulo | Estado |
+| # | Module | Status |
 |---|--------|--------|
-| 0 | Prerequisitos KVM/libvirt en el host | ✅ Completo |
-| 1 | Dos VMs Debian 13 provisionadas con cloud-init | ✅ Completo |
-| 2 | Cluster k3s: control plane + nodo de trabajo | ✅ Completo |
-| 3 | Fundamentos: Namespace, Deployment, Service, labels | ✅ Completo |
-| 4 | Kyverno: admission control y políticas | ✅ Completo |
-| 5 | Falco: detección en runtime con eBPF | ✅ Completo |
-| 6 | Falcosidekick → Elasticsearch → Kibana | ✅ Completo |
-| 7 | NetworkPolicies y Pod Security | 🔨 2 de 4 |
-| 8 | Documentación final y diagramas | ⬜ Pendiente |
+| 0 | KVM/libvirt prerequisites on the host | ✅ Done |
+| 1 | Two Debian 13 VMs provisioned with cloud-init | ✅ Done |
+| 2 | k3s cluster: control plane + worker node | ✅ Done |
+| 3 | Fundamentals: Namespace, Deployment, Service, labels | ✅ Done |
+| 4 | Kyverno: admission control and policies | ✅ Done |
+| 5 | Falco: runtime detection with eBPF | ✅ Done |
+| 6 | Falcosidekick → Elasticsearch → Kibana | ✅ Done |
+| 7 | NetworkPolicies and Pod Security | 🔨 2 of 4 |
+| 8 | Final documentation and diagrams | ⬜ Pending |
 
-**Verificado:** la suite de casos negativos de las políticas pasa 5 de 5 ([`tests/`](tests/)); la regla propia de Falco detecta el robo de token de Service Account en dos imágenes con rutas de montaje distintas, con el ruido afinado de 804 alertas a 1; el pipeline indexa en Elasticsearch de punta a punta; y las políticas de Pod Security rechazan pods privilegiados y con root **sin dejar de permitir que el DaemonSet de Falco recree sus propios pods** — que es la prueba que valida el diseño de las excepciones.
+**Verified:** the policy negative-test suite passes 5 of 5 ([`tests/`](tests/)); the custom Falco rule detects Service Account token theft across two images with different mount paths, with noise tuned down from 804 alerts to 1; the pipeline indexes into Elasticsearch end to end; and the Pod Security policies reject privileged and root pods **while still allowing the Falco DaemonSet to recreate its own pods** — which is the test that actually validates the exemption design.
 
 ---
 
-## Arquitectura
+## Architecture
 
 ```
         HOST (CachyOS · 16 cores · 15 GB RAM)
-        kubectl · helm · navegador → Kibana
-        ufw activo, con reglas explícitas para el lab
+        kubectl · helm · browser → Kibana
+        ufw enabled, with explicit rules for the lab
                         │
-              virbr0 — NAT libvirt — 192.168.122.0/24
+              virbr0 — libvirt NAT — 192.168.122.0/24
                         │
         ┌───────────────┴────────────────┐
         │                                │
@@ -44,92 +46,93 @@ El objetivo del repositorio no es demostrar que el stack levanta, sino documenta
 │  Kyverno          │          │  Kibana           │
 │  Falco (DaemonSet)│          │  Falco (DaemonSet)│
 └───────────────────┘          └───────────────────┘
-   Debian 13.6 · kernel 6.12 · arranque UEFI · BTF presente
+   Debian 13.6 · kernel 6.12 · UEFI boot · BTF present
 ```
 
-Falco corre como **DaemonSet**: una instancia por nodo, cada una observando las syscalls de su propio kernel.
+Falco runs as a **DaemonSet**: one instance per node, each watching the syscalls of its own kernel.
 
 ---
 
-## Stack y por qué
+## Stack, and why
 
-| Componente | Elección | Motivo |
+| Component | Choice | Rationale |
 |---|---|---|
-| Cluster | **k3s** | Un binario con todo el control plane. Certificado por CNCF y usado en producción en edge, no un juguete. |
-| Infraestructura | **libvirt/KVM** | Kernels reales por nodo. Falco observa syscalls: en contenedores compartiendo el kernel del host las reglas no se comportan como en producción. |
-| Guest | **Debian 13 genericcloud** | Imagen mínima solo con virtio. Kernel 6.12 con `CONFIG_DEBUG_INFO_BTF=y`, requisito para eBPF sin compilar módulos. |
-| Provisioning | **cloud-init (NoCloud)** | Nodos reproducibles desde YAML versionado, sin instalación manual. |
-| Admission control | **Kyverno** | Las políticas son objetos de Kubernetes en YAML: se versionan en git y se explican sin traducir un lenguaje aparte. OPA/Gatekeeper tiene más poder y bastante más curva. |
-| Runtime security | **Falco** | Estándar CNCF para detección basada en syscalls. |
-| Alertas | **Falcosidekick + ELK** | Falco detecta; el pipeline convierte la detección en algo consultable e histórico. |
+| Cluster | **k3s** | A single binary containing the whole control plane. CNCF-certified and used in production at the edge — not a toy. |
+| Infrastructure | **libvirt/KVM** | Real kernels per node. Falco observes syscalls, and in containers sharing the host kernel the rules don't behave the way they would in production. |
+| Guest | **Debian 13 genericcloud** | Minimal image, virtio only. Kernel 6.12 with `CONFIG_DEBUG_INFO_BTF=y`, which is what makes eBPF work without compiling modules. |
+| Provisioning | **cloud-init (NoCloud)** | Reproducible nodes from version-controlled YAML, no manual installation. |
+| Admission control | **Kyverno** | Policies are Kubernetes objects written in YAML: they live in git and can be explained without translating a separate language. OPA/Gatekeeper is more powerful and considerably steeper. |
+| Runtime security | **Falco** | The CNCF standard for syscall-based detection. |
+| Alerting | **Falcosidekick + ELK** | Falco detects; the pipeline turns detection into something queryable and historical. |
 
-### Prevención y detección son capas distintas
+### Prevention and detection are different layers
 
-El proyecto combina deliberadamente dos enfoques complementarios:
+The project deliberately combines two complementary approaches:
 
-- **Kyverno actúa en la puerta.** Un pod rechazado en admission nunca ejecutó una línea de código. Es prevención, y solo alcanza para lo que se puede decidir mirando el manifest.
-- **Falco actúa adentro.** Un contenedor legítimo que a las tres semanas abre una shell inesperada o lee `/etc/shadow` pasó todos los controles de admisión. Eso solo se ve observando comportamiento.
+- **Kyverno acts at the door.** A pod rejected at admission never executed a single line of code. That's prevention, and it only covers what can be decided by looking at the manifest.
+- **Falco acts inside.** A legitimate container that three weeks later opens an unexpected shell or reads `/etc/shadow` passed every admission check. That is only visible by observing behaviour.
 
-Ninguna de las dos capas reemplaza a la otra, y esa es la tesis del lab.
+Neither layer replaces the other, and that's the thesis of the lab.
 
 ---
 
-## Estructura del repositorio
+## Repository layout
 
 ```
 ├── docs/
-│   ├── bitacora.md         Incidentes con diagnóstico y causa raíz
-│   └── estado-sesion.md    Estado de avance y punto de retomada
+│   ├── journal.md          Incidents with diagnosis and root cause (English)
+│   ├── bitacora.md         The same incidents in Spanish
+│   └── estado-sesion.md    Progress state and resume point
 ├── infra/
-│   └── cloud-init/         user-data y meta-data de cada nodo (NoCloud)
-├── manifests/              App de ejemplo y pod de simulación de ataques
-├── policies/               ClusterPolicies de Kyverno
+│   └── cloud-init/         user-data and meta-data for each node (NoCloud)
+├── manifests/              Sample app and the attack-simulation pod
+├── policies/               Kyverno ClusterPolicies
 ├── falco/
-│   └── values.yaml         Configuración completa de Falco: driver, salida y reglas propias
-├── elk/                    Elasticsearch (StatefulSet) y Kibana (Deployment)
-├── netpol/                 NetworkPolicies de aislamiento
-└── tests/                  Casos negativos de las políticas, con resultados esperados
+│   └── values.yaml         Full Falco configuration: driver, output and custom rules
+├── elk/                    Elasticsearch (StatefulSet) and Kibana (Deployment)
+├── netpol/                 Isolation NetworkPolicies
+└── tests/                  Policy negative tests, with expected results
 ```
 
 ---
 
-## Reproducirlo
+## Reproducing it
 
-Requiere un host Linux con virtualización por hardware (`vmx` o `svm`), ~10 GB de RAM libre y 45 GB de disco.
+Requires a Linux host with hardware virtualization (`vmx` or `svm`), ~10 GB of free RAM and 45 GB of disk.
 
-### 1. Host: virtualización
+### 1. Host: virtualization
 
 ```bash
 sudo pacman -S --needed qemu-desktop libvirt virt-install dnsmasq openbsd-netcat libisoburn
 sudo systemctl enable --now libvirtd.socket
-sudo usermod -aG libvirt $USER      # requiere volver a iniciar sesión
+sudo usermod -aG libvirt $USER      # requires logging out and back in
 sudo virsh net-start default && sudo virsh net-autostart default
 ```
 
-En fish, para no repetir `-c qemu:///system` en cada comando:
+On fish, so you don't have to repeat `-c qemu:///system` on every command:
 
 ```fish
 set -Ux LIBVIRT_DEFAULT_URI qemu:///system
 ```
 
-### 2. Firewall del host
+### 2. Host firewall
 
-Si usás `ufw`, sin estas reglas los guests no obtienen IP ni salida a internet ([bitácora #6](docs/bitacora.md)):
+If you run `ufw`, without these rules the guests get neither an IP address nor outbound connectivity ([journal #6](docs/journal.md)):
 
 ```bash
 sudo ufw allow in on virbr0 to any port 67 proto udp comment 'libvirt DHCP'
 sudo ufw allow in on virbr0 to any port 53 comment 'libvirt DNS'
-sudo ufw route allow in on virbr0 out on <interfaz-de-salida> comment 'k3s lab egress'
+sudo ufw route allow in on virbr0 out on <uplink-interface> comment 'k3s lab egress'
 sudo ufw reload
 ```
 
-### 3. Imagen base y discos
+### 3. Base image and disks
 
 ```bash
 cd /tmp
 curl -LO https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2
 curl -LO https://cloud.debian.org/images/cloud/trixie/latest/SHA512SUMS
-sha512sum --ignore-missing -c SHA512SUMS      # verificar antes de ejecutar
+sha512sum --ignore-missing -c SHA512SUMS      # verify before you execute it
 sudo mv debian-13-genericcloud-amd64.qcow2 /var/lib/libvirt/images/
 
 cd /var/lib/libvirt/images
@@ -137,9 +140,9 @@ sudo qemu-img create -f qcow2 -F qcow2 -b debian-13-genericcloud-amd64.qcow2 k3s
 sudo qemu-img create -f qcow2 -F qcow2 -b debian-13-genericcloud-amd64.qcow2 k3s-agent.qcow2 20G
 ```
 
-Los discos son overlays copy-on-write: arrancan en ~200 KB. **La imagen base no debe modificarse ni borrarse**, o se corrompen los dos nodos.
+The disks are copy-on-write overlays: they start out at ~200 KB. **The base image must not be modified or deleted**, or both nodes are corrupted.
 
-### 4. Semillas de cloud-init
+### 4. cloud-init seeds
 
 ```bash
 cd infra/cloud-init
@@ -154,9 +157,9 @@ xorrisofs -output /tmp/seed-agent.iso  -volid cidata -joliet -rock seed/agent
 sudo mv /tmp/seed-*.iso /var/lib/libvirt/images/
 ```
 
-Reemplazá la clave pública en los `user-data-*.yaml` por la tuya. El contrato de NoCloud es estricto: etiqueta de volumen `cidata` y archivos llamados exactamente `user-data` y `meta-data`, sin extensión.
+Replace the public key in the `user-data-*.yaml` files with your own. The NoCloud contract is strict: volume label `cidata`, and files named exactly `user-data` and `meta-data`, with no extension.
 
-### 5. Las VMs
+### 5. The VMs
 
 ```bash
 sudo virt-install \
@@ -168,15 +171,15 @@ sudo virt-install \
   --graphics none --console pty,target_type=serial --import
 ```
 
-Ídem para el agent con 6144 MB, 4 vCPU y sus propios archivos.
+Same for the agent, with 6144 MB, 4 vCPUs and its own files.
 
-⚠️ **`--boot uefi` es obligatorio.** Con arranque BIOS (SeaBIOS) los guests no arrancan: el firmware entra en un ciclo de reintentos y la VM queda ejecutándose sin llegar nunca al kernel ([bitácora #5](docs/bitacora.md)).
+⚠️ **`--boot uefi` is mandatory.** With BIOS boot (SeaBIOS) the guests never come up: the firmware enters a retry loop and the VM sits there "running" without ever reaching the kernel ([journal #5](docs/journal.md)).
 
-⚠️ **No usar `--cloud-init` de `virt-install`.** Combinado con `--noautoconsole` aborta el primer arranque y descarta la ISO de semilla ([bitácora #4](docs/bitacora.md)). De ahí que la semilla se construya a mano en el paso 4.
+⚠️ **Do not use `virt-install --cloud-init`.** Combined with `--noautoconsole` it aborts the first boot and discards the seed ISO ([journal #4](docs/journal.md)). That's why the seed is built by hand in step 4.
 
 ### 6. k3s
 
-En el server:
+On the server:
 
 ```bash
 curl -sfL https://get.k3s.io | sudo sh -s - server \
@@ -184,7 +187,7 @@ curl -sfL https://get.k3s.io | sudo sh -s - server \
 sudo cat /var/lib/rancher/k3s/server/node-token
 ```
 
-En el agent:
+On the agent:
 
 ```bash
 curl -sfL https://get.k3s.io | sudo \
@@ -192,7 +195,7 @@ curl -sfL https://get.k3s.io | sudo \
   sh -s - agent --node-ip 192.168.122.128
 ```
 
-En el host:
+On the host:
 
 ```bash
 sudo pacman -S --needed kubectl helm
@@ -215,7 +218,7 @@ kubectl apply -f policies/
 kubectl get clusterpolicy
 ```
 
-Verificar la suite de casos negativos — los cuatro primeros deben ser rechazados y el quinto aceptado:
+Run the negative-test suite — the first four must be rejected and the fifth accepted:
 
 ```bash
 kubectl apply -f tests/ -n demo --dry-run=server
@@ -223,7 +226,7 @@ kubectl apply -f tests/ -n demo --dry-run=server
 
 ### 8. Falco
 
-Toda la configuración vive en [`falco/values.yaml`](falco/values.yaml): el driver, el formato de salida y las reglas propias.
+All configuration lives in [`falco/values.yaml`](falco/values.yaml): the driver, the output format and the custom rules.
 
 ```bash
 helm repo add falcosecurity https://falcosecurity.github.io/charts && helm repo update
@@ -231,30 +234,30 @@ helm install falco falcosecurity/falco -n falco --create-namespace -f falco/valu
 kubectl rollout status daemonset/falco -n falco
 ```
 
-Para actualizar tras editar el values file, **sin `--reuse-values`** (el archivo ya contiene la configuración completa):
+To update after editing the values file, **without `--reuse-values`** (the file already holds the complete configuration):
 
 ```bash
 helm upgrade falco falcosecurity/falco -n falco -f falco/values.yaml
-helm list -n falco      # verificar que la REVISION subió
+helm list -n falco      # confirm the REVISION went up
 ```
 
-Confirmar que cargó el driver correcto — tiene que aparecer `Opening 'syscall' source with modern BPF probe`:
+Confirm the right driver loaded — you should see `Opening 'syscall' source with modern BPF probe`:
 
 ```bash
 kubectl logs -n falco -l app.kubernetes.io/name=falco --tail=40 | grep -i "BPF probe"
 ```
 
-`driver.kind: modern_ebpf` usa eBPF con **CO-RE** (*Compile Once, Run Everywhere*): el programa viene precompilado y se adapta al kernel local leyendo el BTF en `/sys/kernel/btf/vmlinux`. Sin BTF habría que compilar un módulo contra los headers de cada nodo, e instalar toolchains de compilación en nodos de producción es justamente lo que no se quiere.
+`driver.kind: modern_ebpf` uses eBPF with **CO-RE** (*Compile Once, Run Everywhere*): the program ships precompiled and adapts to the local kernel by reading the BTF at `/sys/kernel/btf/vmlinux`. Without BTF you'd have to compile a module against each node's headers, and installing compiler toolchains on production nodes is exactly what you don't want.
 
-**Probarlo con una intrusión simulada:**
+**Test it with a simulated intrusion:**
 
 ```bash
-kubectl run intruso --image=busybox:1.37 -n demo -- sleep 3600
+kubectl apply -f manifests/04-intruso.yaml
 kubectl exec -it intruso -n demo -- sh
-# adentro:  cat /etc/shadow  y  cat /var/run/secrets/kubernetes.io/serviceaccount/token
+# inside:  cat /var/run/secrets/kubernetes.io/serviceaccount/token
 ```
 
-Y ver las alertas **sin filtrar por severidad** — filtrar por `warning` esconde las reglas `NOTICE`, que son la mayoría de la actividad de reconocimiento:
+And read the alerts **without filtering by severity** — filtering on `warning` hides the `NOTICE` rules, which are most of the reconnaissance activity:
 
 ```bash
 kubectl logs -n falco -l app.kubernetes.io/name=falco --tail=200 \
@@ -262,63 +265,99 @@ kubectl logs -n falco -l app.kubernetes.io/name=falco --tail=200 \
   | jq -r '.priority + " | " + .rule + " | " + (.output_fields["k8s.pod.name"] // "-")'
 ```
 
+### 9. Elasticsearch and Kibana
+
+```bash
+kubectl apply -f elk/
+kubectl rollout status statefulset/elasticsearch -n elk
+kubectl rollout status deployment/kibana -n elk
+```
+
+Falcosidekick is deployed as a subchart from `falco/values.yaml` (`falcosidekick.enabled: true`), which also wires up Falco's `http_output` automatically. Verify the pipeline is indexing:
+
+```bash
+kubectl exec -n elk elasticsearch-0 -- curl -s 'localhost:9200/_cat/indices/falco-*?v'
+```
+
+Kibana is exposed at **http://192.168.122.128:30601** via NodePort. The data view must use the **`falco-*`** wildcard pattern: indices are daily (`falco-2026.08.20`), so a pattern without the wildcard works today and breaks tomorrow.
+
+### 10. NetworkPolicies and Pod Security
+
+```bash
+kubectl apply -f netpol/
+kubectl apply -f policies/
+```
+
+The Pod Security policies are in `Enforce`. The test that validates the exemption design is **not** that they reject a privileged pod — it's that Falco can still recreate its own:
+
+```bash
+kubectl delete pod -n falco -l app.kubernetes.io/name=falco
+kubectl get daemonset falco -n falco    # must return to 2/2
+```
+
+If the exemption is written wrong, nothing fails visibly: the DaemonSet simply never reaches its desired replicas, and the cluster is left without detection.
+
 ---
 
-## Decisiones de seguridad
+## Security decisions
 
-Decisiones tomadas deliberadamente, con su justificación:
+Deliberate choices, with their rationale:
 
-- **El kubeconfig se copia por SSH con `sudo cat`, no con `--write-kubeconfig-mode 644`.** Ese archivo es la credencial de administrador del cluster; aflojarle los permisos para ahorrar un `sudo` sería incoherente con el objetivo del proyecto. Queda en modo `600`.
-- **`ufw` se mantiene activo.** Desactivarlo resolvía el problema de DHCP en un comando. En su lugar se agregaron reglas mínimas, comentadas y documentadas.
-- **La imagen base se verifica con SHA512 antes de ejecutarla.** Verificar el artefacto que vas a correr es el punto de partida, no un trámite.
-- **No se crea el usuario `debian` por defecto de la imagen.** Al declarar `users:` en cloud-init se reemplaza la lista por defecto: menos cuentas, menos superficie.
-- **Imágenes con tag explícito y fijo, nunca `latest`.** Enforzado por política, no por convención.
-- **El `node-token` de k3s es una credencial.** Quien lo tenga puede sumar nodos al cluster, es decir ejecutar cargas en él. No debe llegar al repositorio.
+- **The kubeconfig is copied over SSH with `sudo cat`, not via `--write-kubeconfig-mode 644`.** That file is the cluster's admin credential; loosening its permissions to save one `sudo` would contradict the point of the project. It stays at mode `600`.
+- **`ufw` stays enabled.** Disabling it would have fixed the DHCP problem in one command. Instead, minimal rules were added, commented and documented.
+- **The base image is SHA512-verified before being executed.** Verifying the artifact you're about to run is the starting point, not a formality.
+- **The image's default `debian` user is not created.** Declaring `users:` in cloud-init replaces the default list: fewer accounts, less surface.
+- **Images carry explicit, pinned tags — never `latest`.** Enforced by policy, not by convention.
+- **The Falco policy exemption matches on namespace AND label.** Exempting the whole namespace would also have covered `falcosidekick`, which needs no privileges at all.
+- **Owned workloads were fixed rather than exempted.** `kube-system` is exempted because k3s manages it; `demo` and `elk` were corrected instead. If you exempt everything that fails, the policy protects nothing.
+- **The k3s `node-token` is a credential.** Whoever holds it can join nodes to the cluster — that is, run workloads on it. It must never reach the repository.
 
-### Lo que este lab **no** es
+### What this lab is **not**
 
-Es un entorno de aprendizaje, no una referencia de producción. Limitaciones conscientes:
+It's a learning environment, not a production reference. Conscious limitations:
 
-- Control plane de un solo nodo con SQLite, sin alta disponibilidad.
-- Claves SSH sin passphrase y `sudo` sin contraseña en los nodos.
-- Todos los controladores de Kyverno con una réplica, por restricción de RAM.
-- Elasticsearch sin autenticación ni TLS entre componentes (pendiente de revisar en el módulo 6).
-- Los nodos toman IP por DHCP: pueden cambiar si se recrean las VMs.
+- Single-node control plane backed by SQLite, no high availability.
+- Passphrase-less SSH keys and password-less `sudo` on the nodes.
+- All Kyverno controllers at one replica, due to RAM constraints.
+- **Elasticsearch has no authentication and no TLS.** Today it's protected by network isolation alone: anyone who compromises a pod in the `falco` namespace or the Kibana pod retains full read and delete access. Enabling `xpack.security` is pending.
+- **The SIEM lives inside the cluster it monitors.** Convenient for a lab, an anti-pattern in production: collection should happen outside the trust boundary of the system being watched.
+- Only network ingress is controlled; egress is wide open.
+- Nodes get their addresses over DHCP, so IPs can change if the VMs are recreated.
 
 ---
 
-## Lo más interesante del proyecto
+## The interesting parts
 
-Si vas a leer una sola cosa, leé la [bitácora](docs/bitacora.md). Ocho incidentes con su diagnóstico completo. Dos ejemplos:
+If you only read one thing, read the [journal](docs/journal.md). Twelve incidents with full diagnosis. A few examples:
 
-**Un guest que ejecutaba código sin arrancar nunca.** Las VMs figuraban en ejecución, consumían CPU y leían 3,37 GB de disco, pero no escribían un byte ni transmitían un paquete. Con el archivo de disco bloqueado por la VM en ejecución, el diagnóstico salió de los contadores del hipervisor y del monitor de QEMU: los registros del vCPU mostraban `CS=f000` en modo real de 16 bits, o sea código de BIOS. Diez minutos después del arranque el control nunca había pasado al kernel.
+**A guest executing code without ever booting.** The VMs showed as running, burned CPU and read 3.37 GB from disk, yet wrote not a single byte and transmitted not a single packet. With the disk file write-locked by the running VM, the diagnosis came from the hypervisor's counters and the QEMU monitor: the vCPU registers showed `CS=f000` in 16-bit real mode — BIOS code. Ten minutes after boot, control had never been handed to the kernel.
 
-**Una política de admisión que pasaba su propia prueba y se podía evadir de dos formas.** Bloqueaba `nginx:latest` correctamente. Pero solo validaba `spec.containers`, dejando libres `initContainers` y `ephemeralContainers`; y como buscaba la cadena `:latest`, una imagen sin tag —que el runtime resuelve a `latest` igual— pasaba limpia. Al reescribirla, un error de capitalización (`initcontainers` en lugar de `initContainers`) hizo que la validación se **salteara en silencio**, en una política que reportaba `Ready`.
+**An admission policy that passed its own test and could be bypassed two ways.** It correctly blocked `nginx:latest`. But it only validated `spec.containers`, leaving `initContainers` and `ephemeralContainers` wide open; and because it matched the literal string `:latest`, an untagged image — which the runtime resolves to `latest` anyway — sailed through. On the rewrite, a capitalization error (`initcontainers` instead of `initContainers`) made the validation **skip silently**, inside a policy that reported `Ready`.
 
-**Una regla de detección correcta y, tal como estaba, inservible.** La regla propia de robo de token de Service Account funcionaba: detectaba el ataque. También generaba **804 alertas con 2 verdaderos positivos** — un 0,25% de señal, porque todo componente de Kubernetes lee su propio token para autenticarse. Afinarla exigió antes arreglar la visibilidad (Falco solo emite en el JSON los campos que la plantilla `output` referencia, así que los campos de proceso venían vacíos), y trajo dos hallazgos sobre los campos disponibles: `proc.name` se trunca a 15 caracteres porque viene del `comm` del kernel, y `proc.exepath` colapsa los binarios multi-llamada — en Alpine `cat` reporta `/bin/busybox`. Ninguno de los dos sirve para todo.
+**A detection rule that was correct and, as written, useless.** The custom Service Account token-theft rule worked: it caught the attack. It also produced **804 alerts with 2 true positives** — 0.25% signal, because every Kubernetes component reads its own token to authenticate. Tuning it required fixing visibility first (Falco only emits the fields referenced in the rule's `output` template, so the process fields came back empty), and surfaced two findings about the available fields: `proc.name` is truncated at 15 characters because it comes from the kernel's `comm`, and `proc.exepath` collapses multi-call binaries — on Alpine, `cat` reports `/bin/busybox`. Neither field is right for every case.
 
-**Un SIEM que el atacante podía borrar.** Auditando el cluster antes de escribir políticas apareció que cualquier pod alcanzaba Elasticsearch sin autenticar: se verificó creando y borrando un índice de prueba **desde el pod comprometido**, armando el request HTTP a mano con `nc` porque el `wget` de BusyBox no soporta `--method`. Es decir, un atacante podía eliminar los índices que registraron su propia intrusión, con las herramientas que ya venían en una imagen mínima. Se mitigó con NetworkPolicies; la lección de diseño es que el SIEM no debería vivir dentro de la frontera de confianza del sistema que vigila.
+**A SIEM the attacker could delete.** Auditing the cluster before writing policies revealed that any pod could reach Elasticsearch unauthenticated. It was verified by creating and deleting a throwaway index **from the compromised pod**, hand-crafting the HTTP request with `nc` because BusyBox's `wget` doesn't support `--method`. In other words: an attacker could erase the very indices that recorded their own intrusion, using tooling that already shipped in a minimal image. Mitigated with NetworkPolicies; the design lesson is that the SIEM shouldn't live inside the trust boundary of the system it watches.
 
-**Endurecer también apaga la telemetría.** Al pasar el pod de simulación de root a uid 1000, el mismo ataque dejó de generar dos alertas y generó una: `cat /etc/shadow` ahora da *permission denied*, y el macro `open_read` de Falco exige un descriptor abierto de verdad (`fd.num >= 0`), así que **un open fallido no matchea ninguna regla**. El ataque falló, pero el intento tampoco quedó registrado. Es una interacción entre la capa de prevención y la de detección que no aparece en los tutoriales.
+**Hardening also turns off the telemetry.** Moving the simulation pod from root to uid 1000 changed the same attack from two alerts to one: `cat /etc/shadow` now returns *permission denied*, and Falco's `open_read` macro requires an actually-opened descriptor (`fd.num >= 0`), so **a failed open matches no rule at all**. The attack failed, but the attempt went unrecorded too. That's an interaction between the prevention and detection layers that tutorials don't cover.
 
-**Un patrón que se repitió siete veces.** El instrumento de medición produciendo la conclusión: un `head -5` que llevó a afirmar que no había servidor DHCP cuando sí lo había; un `grep -i warning` que ocultó una detección de prioridad `NOTICE`; un `ignore_above: 256` que hace que una agregación de Kibana devuelva vacío sin error; un `jq` accediendo a un campo ausente que dejó un inventario de violaciones en blanco; un `tail -4` que escondió una de las dos reglas que sí habían rechazado un pod; un caso de prueba que no cubría la intersección de dos condiciones; y un error de capitalización que hacía que una validación se salteara sin fallar. **Ninguno de los siete avisó de que estaba recortando** — y varios ocurrieron después de haber identificado el patrón, que es justamente lo que lo hace interesante.
+**A pattern that recurred seven times.** The measuring instrument producing the conclusion: a `head -5` that led to the claim there was no DHCP server when there was one; a `grep -i warning` that hid a `NOTICE`-priority detection; an `ignore_above: 256` that makes a Kibana aggregation return empty with no error; a `jq` expression touching an absent field that left a violation inventory blank; a `tail -4` that concealed one of the two rules that had in fact rejected a pod; a test case that didn't cover the intersection of two conditions; and a capitalization error that made a validation skip without failing. **None of the seven announced that it was truncating** — and several happened *after* the pattern had been identified, which is precisely what makes it worth writing down.
 
 ---
 
 ## Roadmap
 
-- [x] Políticas de Kyverno con casos negativos versionados en `tests/`
-- [x] Falco con modern eBPF, regla propia y validación con eventos reales
-- [x] Pipeline Falcosidekick → Elasticsearch → Kibana
-- [x] NetworkPolicies aislando la evidencia de las cargas del cluster
-- [x] Pod Security: prohibir `privileged` y exigir `runAsNonRoot`, con excepciones quirúrgicas
-- [ ] `automountServiceAccountToken: false` donde no se necesita: prevención que complementa la regla de robo de token
-- [ ] Demostrar `Drop and execute new binary in container` — la detección que cubre al atacante en contenedores distroless, que debe traer su propio binario
-- [ ] Completar Pod Security: `readOnlyRootFilesystem`, prohibir `hostPath`, `hostNetwork` y `hostPID`, exigir `seccompProfile: RuntimeDefault`
-- [ ] NetworkPolicies de egress (hoy solo se controla el ingress)
-- [ ] Habilitar `xpack.security` con TLS en Elasticsearch: hoy el aislamiento es solo de red
-- [ ] Migrar `tests/` a `kyverno test` para correrlo en CI: con `kubectl apply --dry-run` el exit code queda invertido para casos negativos
-- [ ] RBAC propio del namespace `falco`, que es la vía privilegiada hacia la evidencia
-- [ ] Diagrama de arquitectura y modelo de amenazas
-- [ ] Scripts `infra/lab-up.sh` y `lab-down.sh` para levantar y bajar el lab
-- [ ] *(candidato)* GitOps con Argo CD o Flux, que elimina por diseño el desfase entre lo declarado en el repo y lo aplicado en el cluster
+- [x] Kyverno policies with negative tests versioned under `tests/`
+- [x] Falco with modern eBPF, a custom rule, and validation against real events
+- [x] Falcosidekick → Elasticsearch → Kibana pipeline
+- [x] NetworkPolicies isolating the evidence from cluster workloads
+- [x] Pod Security: forbid `privileged`, require `runAsNonRoot`, with surgical exemptions
+- [ ] `automountServiceAccountToken: false` where it isn't needed: the prevention that complements the token-theft rule
+- [ ] Demonstrate `Drop and execute new binary in container` — the detection that covers an attacker in a distroless container, who has to bring their own binary
+- [ ] Finish Pod Security: `readOnlyRootFilesystem`, forbid `hostPath`, `hostNetwork` and `hostPID`, require `seccompProfile: RuntimeDefault`
+- [ ] Egress NetworkPolicies (only ingress is controlled today)
+- [ ] Enable `xpack.security` with TLS on Elasticsearch: today the isolation is network-only
+- [ ] Migrate `tests/` to `kyverno test` so it can run in CI: with `kubectl apply --dry-run` the exit code is inverted for negative tests
+- [ ] Dedicated RBAC for the `falco` namespace, which is now the privileged path to the evidence
+- [ ] Architecture diagram and threat model
+- [ ] `infra/lab-up.sh` and `lab-down.sh` scripts to bring the lab up and down
+- [ ] *(candidate)* GitOps with Argo CD or Flux, which eliminates by design the drift between what the repo declares and what the cluster runs

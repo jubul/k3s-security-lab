@@ -1,35 +1,35 @@
-# Casos de prueba de las políticas
+# Policy test cases
 
-Casos negativos de las ClusterPolicies de [`../policies/`](../policies/). Cada archivo es un Pod mínimo que ejercita **una** vía de evasión, con el resultado esperado declarado en el encabezado.
+Negative test cases for the Kyverno ClusterPolicies in [`../policies/`](../policies/). Each file is a minimal Pod exercising **one** bypass route, with its expected result declared in the header comment.
 
-## Ejecutar
+## Running them
 
 ```bash
 kubectl apply -f tests/ -n demo --dry-run=server
 ```
 
-`--dry-run=server` envía el objeto al API server, que lo pasa por los admission webhooks y devuelve el veredicto **sin persistir nada**. Es la forma correcta de probar políticas: se ejercita la ruta real de admisión, no una simulación.
+`--dry-run=server` sends the object to the API server, which runs it through the admission webhooks and returns the verdict **without persisting anything**. This is the right way to test policies: it exercises the real admission path, not a simulation of it.
 
-## Resultados esperados
+## Expected results
 
-| Archivo | Vía probada | Regla que debe atraparlo | Esperado |
+| File | Route tested | Rule that must catch it | Expected |
 |---|---|---|---|
-| `01-latest-container.yaml` | `:latest` en `containers` | `validate-image-tag` | 🚫 bloqueado |
-| `02-notag-container.yaml` | sin tag en `containers` | `require-image-tag` | 🚫 bloqueado |
-| `03-latest-initcontainer.yaml` | `:latest` en `initContainers` | `validate-image-tag` | 🚫 bloqueado |
-| `04-notag-initcontainer.yaml` | sin tag en `initContainers` | `require-image-tag` | 🚫 bloqueado |
-| `05-valido.yaml` | todo con tags fijos | ninguna | ✅ permitido |
+| `01-latest-container.yaml` | `:latest` in `containers` | `validate-image-tag` | 🚫 blocked |
+| `02-notag-container.yaml` | no tag in `containers` | `require-image-tag` | 🚫 blocked |
+| `03-latest-initcontainer.yaml` | `:latest` in `initContainers` | `validate-image-tag` | 🚫 blocked |
+| `04-notag-initcontainer.yaml` | no tag in `initContainers` | `require-image-tag` | 🚫 blocked |
+| `05-valido.yaml` | everything pinned | none | ✅ allowed |
 
-Los cuatro primeros deben devolver un error de admisión; el quinto debe reportar `created (server dry run)`.
+The first four must return an admission error; the fifth must report `created (server dry run)`.
 
-## Criterio de diseño
+## Design criteria
 
-**En los casos 03 y 04 el contenedor principal es deliberadamente válido.** Si el caso falla, la única causa posible es el initContainer. Un caso de prueba con dos cosas mal a la vez no distingue cuál de las dos regla lo atrapó, y deja de servir como diagnóstico.
+**In cases 03 and 04 the main container is deliberately valid.** If the case fails, the only possible cause is the initContainer. A test case with two things wrong at once can't tell you which rule caught it, and stops being useful as a diagnostic.
 
-**El caso positivo no es opcional.** Una política que bloquea todo es igual de inútil que una que no bloquea nada. El `05` verifica que los *conditional anchors* (`=(campo)`) funcionen: sin ellos, un Pod que no declara `initContainers` fallaría la validación por no tener un campo que no le corresponde tener.
+**The positive case isn't optional.** A policy that blocks everything is as useless as one that blocks nothing. Case `05` verifies that the *conditional anchors* (`=(field)`) work: without them, a Pod that doesn't declare `initContainers` would fail validation for lacking a field it has no business having.
 
-**Un archivo, una vía.** El caso `04` es el que detectó el bug residual de [`bitacora.md` #8](../docs/bitacora.md): un error de capitalización (`initcontainers` en lugar de `initContainers`) presente en una sola de las dos reglas. Es el único caso que necesita esa regla **y** esa lista de contenedores simultáneamente — con casos más gruesos, el agujero pasaba desapercibido.
+**One file, one route.** Case `04` is the one that caught the residual bug from [`journal.md` #8](../docs/journal.md): a capitalization error (`initcontainers` instead of `initContainers`) present in only one of the two rules. It's the only case that needs that rule **and** that container list simultaneously — with coarser cases, the hole went unnoticed.
 
-## Próximo paso
+## Next step
 
-Migrar a **`kyverno test`**, el CLI de Kyverno, que declara el resultado esperado de cada caso en un archivo y corre **sin cluster**. Eso permite ejecutar la suite en CI y hacer que un pull request que abra un agujero en una política falle el pipeline.
+Migrate to **`kyverno test`**, the Kyverno CLI, which declares each case's expected result in a file and runs **without a cluster**. That allows running the suite in CI and making a pull request that opens a policy hole fail the pipeline.

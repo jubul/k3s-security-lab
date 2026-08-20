@@ -1,5 +1,7 @@
 # Bitácora de incidentes
 
+*[English](journal.md) · **Español***
+
 Registro de los problemas reales encontrados durante la construcción del lab, con el diagnóstico y la causa raíz de cada uno. El valor de este archivo no está en la lista de comandos que funcionaron, sino en el razonamiento que llevó a encontrar los que no.
 
 Formato de cada entrada: síntoma → diagnóstico → causa raíz → solución → aprendizaje.
@@ -214,7 +216,7 @@ La semilla explícita es reproducible y versionable: quedó como infraestructura
 
 ## #5 — Los guests nunca salen del firmware: SeaBIOS no arranca la imagen
 
-**Fecha:** 2026-08-17 · **Módulo:** 1 (VMs) · **Estado:** solución en prueba
+**Fecha:** 2026-08-17 · **Módulo:** 1 (VMs) · **Estado:** resuelto
 
 ### Síntoma
 
@@ -371,7 +373,7 @@ Los clientes DHCP de los guests ya habían agotado sus reintentos, así que hubo
 
 ## #7 — La política de Kyverno que funcionaba y se podía evadir de dos formas
 
-**Fecha:** 2026-08-17 · **Módulo:** 4 (Kyverno) · **Estado:** resuelto parcialmente (ver #8)
+**Fecha:** 2026-08-17 · **Módulo:** 4 (Kyverno) · **Estado:** resuelto (ver #8)
 
 ### Síntoma
 
@@ -440,7 +442,7 @@ Hicieron falta dos reglas y no una: las dos validaciones aplican sobre la misma 
 
 ## #8 — Tres bugs silenciosos en la política endurecida
 
-**Fecha:** 2026-08-17 · **Módulo:** 4 (Kyverno) · **Estado:** dos resueltos, uno abierto
+**Fecha:** 2026-08-17 · **Módulo:** 4 (Kyverno) · **Estado:** resuelto
 
 ### Síntoma
 
@@ -464,7 +466,7 @@ Los nombres de objetos de Kubernetes son subdominios DNS RFC 1123 y no admiten m
 
 El escenario peligroso era la suma de 1, 2 y 3. Corrigiendo solo el nombre, la política se habría aplicado, habría reportado `Ready`, habría bloqueado `nginx:latest` en `containers` — y habría dejado los dos agujeros de #7 intactos, con toda la apariencia de estar funcionando.
 
-### Bug residual (abierto)
+### Bug residual (ya cerrado)
 
 Tras corregir el nombre y separar las dos reglas, quedó una divergencia entre ellas:
 
@@ -485,7 +487,7 @@ container sin tag           →  BLOQUEADO
 pod correcto                →  created     (sin falsos positivos)
 ```
 
-El agujero sobrevive exactamente en la intersección de las dos condiciones: initContainer **y** tag omitido. Pendiente: corregir la línea 19 de `policies/01-disallow-latest-tag.yaml`.
+El agujero sobrevivía exactamente en la intersección de las dos condiciones: initContainer **y** tag omitido. Se cerró después, y la suite de casos negativos pasa ahora 5 de 5.
 
 ### Aprendizaje
 
