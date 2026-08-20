@@ -1,0 +1,77 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: pod-security
+spec:
+  background: true
+  rules:
+    - name: disallow-privileged
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      # Excepcion quirurgica: SOLO el DaemonSet de Falco, que necesita privileged
+      # para instrumentar el kernel del nodo. Se excluye por namespace Y label, no
+      # por namespace solo: falcosidekick vive en el mismo namespace y no necesita
+      # ningun privilegio, asi que sigue sujeto a la politica.
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - falco
+              selector:
+                matchLabels:
+                  app.kubernetes.io/name: falco
+      validate:
+        failureAction: Enforce
+        message: "Seguridad comprometida: No se permite privileged: true ni allowPrivilegeEscalation: true."
+        pattern:
+          spec:
+            containers:
+              - =(securityContext):
+                  =(privileged): "false"
+                  =(allowPrivilegeEscalation): "false"
+            =(initContainers):
+              - =(securityContext):
+                  =(privileged): "false"
+                  =(allowPrivilegeEscalation): "false"
+            =(ephemeralContainers):
+              - =(securityContext):
+                  =(privileged): "false"
+                  =(allowPrivilegeEscalation): "false"
+
+    - name: require-run-as-nonroot
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      # kube-system lo gestiona k3s (CoreDNS, local-path-provisioner, svclb): modificar
+      # esas cargas es inutil porque el proximo upgrade las sobrescribe.
+      # falco corre como root por necesidad del driver eBPF.
+      # PENDIENTE: falcosidekick SI puede correr non-root; configurarlo via
+      # falco/values.yaml y estrechar esta exclusion al label del DaemonSet.
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - falco
+      validate:
+        failureAction: Enforce
+        message: "El Pod o sus contenedores deben declarar explícitamente runAsNonRoot: true."
+        anyPattern:
+          - spec:
+              securityContext:
+                runAsNonRoot: true
+          - spec:
+              containers:
+                - securityContext:
+                    runAsNonRoot: true
+              =(initContainers):
+                - securityContext:
+                    runAsNonRoot: true
+              =(ephemeralContainers):
+                - securityContext:
+                    runAsNonRoot: true

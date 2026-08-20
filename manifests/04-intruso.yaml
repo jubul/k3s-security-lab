@@ -1,0 +1,35 @@
+# Pod de simulación de intrusiones, usado para validar las reglas de Falco
+# (lectura del token de Service Account, shell interactiva, acceso a archivos
+# sensibles). No es parte de la aplicación de ejemplo.
+#
+# Cumple la ClusterPolicy pod-security. Nota sobre por qué hacen falta las tres
+# claves y no solo runAsNonRoot: la imagen de busybox declara USER root, así que
+# con runAsNonRoot: true a secas el kubelet rechaza el arranque con
+# CreateContainerConfigError ("container has runAsNonRoot and image will run as
+# root"). El chequeo compara el usuario efectivo de la imagen contra la
+# exigencia, así que hay que indicarle explícitamente con qué uid correr.
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: intruso
+  namespace: demo
+  labels:
+    app: intruso
+    rol: simulacion-ataque
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+  containers:
+    - name: intruso
+      image: busybox:1.37
+      command: ["sleep", "3600"]
+      resources:
+        requests:
+          memory: "16Mi"
+          cpu: "10m"
+        limits:
+          memory: "64Mi"
+          cpu: "100m"

@@ -3,7 +3,15 @@ driver:
 tty: true
 falco:
   json_output: true
-
+falcosidekick:
+  enabled: true
+  webui:
+    enabled: false
+  config:
+    elasticsearch:
+      hostport: http://elasticsearch.elk.svc.cluster.local:9200
+      index: falco
+  
 customRules:
   custom-rules.yaml: |-
     - rule: Detect Service Account Token Read

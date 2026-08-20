@@ -657,3 +657,168 @@ La regla filtra por nombre de proceso, así que **no detecta a un atacante que l
 **Afinar es la mitad del trabajo, y se hace con datos.** El discriminador correcto no se adivina: se emite el campo, se mide la distribución y se decide sobre la evidencia. Las dos hipótesis que se plantearon antes de medir (que el ruido venía de los binarios de las apps, y que el problema del symlink afectaba por imagen) resultaron una correcta y una equivocada.
 
 **Una detección sin afinar no es una detección a medias, es ninguna.** 804 eventos con 2 verdaderos positivos no se triagean: se ignoran. Y una regla que se ignora es peor que no tenerla, porque genera la sensación de estar cubierto.
+
+---
+
+## #11 — La evidencia expuesta: cualquier pod podía borrar los índices de Falco
+
+**Fecha:** 2026-08-20 · **Módulo:** 7 (seguridad en k8s) · **Estado:** mitigado
+
+### Síntoma
+
+Ninguno. Se encontró auditando el estado del cluster antes de escribir políticas, no por un fallo.
+
+### Diagnóstico
+
+Elasticsearch se despliega con `xpack.security.enabled=false` (decisión consciente del módulo 6, documentada). Sin NetworkPolicies, eso significa que el Service `elasticsearch.elk.svc.cluster.local:9200` era alcanzable desde **cualquier pod del cluster**, sin autenticar.
+
+Verificado desde el pod de simulación de ataque, en tres pasos:
+
+```
+GET  /_cat/indices    → lista todos los índices, incluido falco-2026.08.20
+PUT  /prueba-netpol   → índice creado
+DELETE /prueba-netpol → índice borrado
+```
+
+Se usó un índice de prueba descartable; no se tocó `falco-*`.
+
+**Detalle relevante de la técnica:** el `wget` de BusyBox no soporta `--method`, así que las escrituras se hicieron con `nc`, armando el request HTTP a mano:
+
+```sh
+printf 'DELETE /prueba-netpol HTTP/1.1\r\nHost: es\r\nConnection: close\r\n\r\n' | nc elasticsearch.elk.svc.cluster.local 9200
+```
+
+*Living off the land* con lo que trae una imagen mínima. "La imagen es chica" no es un control de seguridad.
+
+### Causa raíz
+
+El SIEM vivía dentro de la frontera de confianza del sistema que vigila, sin autenticación ni aislamiento de red. Un atacante que compromete cualquier contenedor podía **borrar los índices que registraron su propia intrusión**.
+
+### Solución
+
+Tres NetworkPolicies en el namespace `elk`:
+
+1. `default-deny-ingress` con `podSelector: {}` — cierra el namespace entero.
+2. `allow-elasticsearch` — puerto 9200 solo desde el namespace `falco` (vía `namespaceSelector` sobre la label automática `kubernetes.io/metadata.name`) **o** desde los pods con label `app: kibana`.
+3. `allow-kibana` — puerto 5601 desde `ipBlock: 192.168.122.0/24`.
+
+El `ipBlock` es necesario porque el tráfico que entra por el NodePort **no viene de un pod**: kube-proxy lo hace SNAT a la IP del nodo, así que ningún `podSelector` lo matchea.
+
+**Verificación, con control positivo:**
+
+```
+DNS desde el pod atacante   resuelve a 10.42.1.29     ← el bloqueo no es un fallo de DNS
+pod atacante → 10.42.1.29   BLOQUEADO
+falcosidekick → ES          ALCANZABLE                ← control positivo
+Kibana desde el host        HTTP 200
+logs de Kibana              sin errores contra ES
+```
+
+El control positivo es la parte que valida la prueba: si `falcosidekick` también hubiera quedado bloqueado, no se sabría si la política discrimina o si simplemente rompió todo.
+
+### Aprendizaje
+
+**La semántica de `from` en una NetworkPolicy depende de un guión.** Dos ítems separados en la lista son **OR**; dos selectores bajo el mismo ítem son **AND**:
+
+```yaml
+from:
+  - namespaceSelector: {...}     # OR
+  - podSelector: {...}
+from:
+  - namespaceSelector: {...}     # AND — aquí sería el conjunto vacío
+    podSelector: {...}
+```
+
+**Posible fallo silencioso a tener en cuenta:** k3s trae su controlador de NetworkPolicy embebido, pero si se arranca con `--disable-network-policy` el API server **acepta** los objetos y nadie los aplica. Política creada, cero efecto, ningún error. Solo la prueba de conectividad lo detecta.
+
+### Lo que esto no resuelve
+
+- **Sin control de egress.** Se cerró quién entra a `elk`; los pods siguen pudiendo salir a cualquier parte.
+- **Elasticsearch sigue sin autenticación.** El control es solo de red: quien comprometa un pod del namespace `falco` o el de Kibana mantiene acceso total de lectura y borrado.
+- **El namespace `falco` es ahora una vía privilegiada** hacia la evidencia, además de correr el pod más privilegiado del cluster. Necesita su propio RBAC.
+
+---
+
+## #12 — Endurecer sin matar la herramienta de seguridad
+
+**Fecha:** 2026-08-20 · **Módulo:** 7 (seguridad en k8s) · **Estado:** resuelto
+
+### Contexto
+
+Aplicar Pod Security con Kyverno: prohibir `privileged` y exigir `runAsNonRoot`. El problema de fondo es que **Falco es el componente más privilegiado del cluster**: su DaemonSet corre `privileged: true` y monta del host `/boot`, `/lib/modules`, `/usr`, `/etc`, `/sys/kernel`, `/proc` y todos los sockets de runtime de contenedores. Una política restrictiva mal diseñada impide que el DaemonSet recree sus pods, y **el resultado es quedarse sin detección sin que nada falle de forma visible**: el DaemonSet simplemente no alcanza las réplicas deseadas.
+
+### El inventario primero
+
+La política se aplicó primero en modo **`Audit`**, que no rechaza nada y escribe los resultados en los `policyreport`. Resultado sobre el cluster completo:
+
+```
+29 violaciones en 4 namespaces
+  require-run-as-nonroot   kube-system 9 · falco 7 · elk 5 · demo 5
+  disallow-privileged      falco 3
+```
+
+Dos conclusiones: **nada** en el cluster declaraba `runAsNonRoot`, y el privilegio estaba concentrado en un único componente identificado y justificado.
+
+Ese orden —auditar, medir, decidir excepciones, después enforce— es el mismo bucle que se usó para afinar la regla de Falco en #10: primero visibilidad, después restricción. Enforce a ciegas sobre un cluster con cargas es cómo se causan incidentes con la excusa de prevenirlos.
+
+### Criterio de las excepciones
+
+**Para `disallow-privileged`, excepción quirúrgica.** Lo obvio sería exceptuar el namespace `falco` completo; es incorrecto, porque ahí también vive `falcosidekick`, que no necesita ningún privilegio. Se excluye por namespace **y** label:
+
+```yaml
+exclude:
+  any:
+    - resources:
+        namespaces: [falco]
+        selector:
+          matchLabels:
+            app.kubernetes.io/name: falco
+```
+
+**Para `require-run-as-nonroot`, criterio de propiedad.** `kube-system` no es propio: CoreDNS, local-path-provisioner y svclb los gestiona k3s y el próximo upgrade sobrescribe cualquier cambio. Se exceptúan y se documenta. Pero `demo` y `elk` sí son propios, y ahí la respuesta correcta **no es la excepción sino arreglar las cargas**: si se exceptúa todo lo que falla, la política no protege nada y solo produce sensación de cumplimiento.
+
+### Los cinco defectos encontrados en la revisión
+
+1. **Los bloques `exclude` estaban ausentes por completo, con las dos reglas ya en `Enforce`.** El defecto grave: aplicarla habría impedido que Falco recreara sus pods.
+2. **La imagen de `web` decía `nginx-unprivileged:1.29-alpine`, sin el prefijo `nginxinc/`.** Verificado contra el registro: `docker.io/library/nginx-unprivileged` devuelve `object not found`. `ImagePullBackOff` garantizado.
+3. **El Deployment `web` no tenía `securityContext`.**
+4. **Ese `securityContext` había terminado como campo raíz de `03-demo-service.yaml`**, donde no hace absolutamente nada. Se fue de archivo.
+5. **Kibana tampoco tenía `securityContext`**, así que habría sido rechazado en su próximo reinicio.
+
+Y otra vez el desfase entre archivo editado y cluster: la política no estaba aplicada. Cuarta aparición en el proyecto; esta vez evitó el daño.
+
+### Un hallazgo sobre `runAsNonRoot`
+
+Elasticsearch y Kibana **ya corrían como uid 1000**: los cambios en ellos fueron puramente declarativos. Eso no los vuelve superfluos. `runAsNonRoot: true` hace que el **kubelet se niegue a arrancar** el contenedor si el usuario efectivo de la imagen resuelve a root. Sin declararlo, hoy corre como 1000 porque la imagen lo dice, y un pull de una versión futura que cambie el `USER` devuelve el proceso a root sin que nadie se entere. Declararlo convierte una costumbre en una garantía verificada.
+
+El corolario práctico apareció al recrear el pod de simulación: `runAsNonRoot: true` **por sí solo no alcanza** para una imagen que declara `USER root`, como busybox. El kubelet rechaza el arranque con `CreateContainerConfigError` ("container has runAsNonRoot and image will run as root"). Hay que indicar explícitamente `runAsUser`.
+
+### Verificación
+
+```
+pod privilegiado          RECHAZADO por disallow-privileged Y require-run-as-nonroot
+pod sin runAsNonRoot      RECHAZADO
+pod que cumple            ACEPTADO
+Falco tras borrar pods    2/2 listos, modern BPF probe, custom-rules.yaml cargado
+web                       HTTP 200 como uid=101(nginx)
+namespace demo            sin incumplimientos
+```
+
+La prueba de borrar los pods de Falco es la que valida el diseño de la excepción. Sin ella, el fallo aparecería semanas después, en el próximo reinicio de un nodo.
+
+### Efecto de segundo orden: endurecer también reduce la telemetría
+
+Con el pod de simulación corriendo como uid 1000 en lugar de root, el mismo ataque produce un resultado distinto:
+
+```
+cat /var/run/secrets/.../token   → leído       → ALERTA de Falco
+cat /etc/shadow                  → Permission denied → SIN alerta
+```
+
+Antes generaba dos alertas; ahora genera una. La razón es que el macro `open_read` de Falco exige `fd.num >= 0`, es decir un descriptor abierto de verdad: **un open fallido no matchea**. El endurecimiento bloqueó el ataque *y* eliminó el registro del intento.
+
+No es un problema —el ataque no funcionó— pero es una interacción entre las capas de prevención y detección que conviene tener presente: **al endurecer las cargas, el dashboard ve menos, y parte de lo que deja de ver son intentos fallidos que sí tienen valor forense.** Detectar intentos rechazados requiere reglas construidas con otras condiciones.
+
+### Pendiente documentado
+
+`falcosidekick` puede correr non-root: corresponde configurarlo vía `falco/values.yaml` y estrechar la exclusión de `require-run-as-nonroot` al label del DaemonSet, en lugar de exceptuar el namespace completo.

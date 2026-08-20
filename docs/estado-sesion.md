@@ -2,8 +2,8 @@
 
 > Documento de handoff. Se actualiza al cerrar cada módulo para poder retomar sin recontextualizar.
 
-**Última actualización:** 2026-08-18, cierre del Módulo 5. Módulos 0 a 5 completos.
-**Siguiente:** Módulo 6 — Falcosidekick → Elasticsearch → Kibana.
+**Última actualización:** 2026-08-20. Módulos 0 a 6 completos; módulo 7 (seguridad en k8s) con dos de cuatro partes hechas.
+**Siguiente:** cerrar 7.3 (`automountServiceAccountToken: false`) y 7.4 (demostrar la regla `Drop and execute new binary in container`).
 
 ---
 
@@ -86,9 +86,10 @@ Las IPs se mantuvieron tras el primer reboot (dnsmasq respeta las concesiones), 
 | 3 | Fundamentos k8s (namespace, deployment, service, labels) | **Completo** |
 | 4 | Kyverno: admission control y políticas | **Completo** |
 | 5 | Falco: modern eBPF y reglas custom | **Completo** |
-| 6 | Falcosidekick → Elasticsearch → Kibana | **Siguiente** |
-| 7 | Documentación final y diagramas | Pendiente |
-| 8 | *(candidato)* GitOps con Argo CD o Flux | Idea |
+| 6 | Falcosidekick → Elasticsearch → Kibana | **Completo** |
+| 7 | Seguridad en k8s: NetworkPolicies y Pod Security | **En curso (2 de 4)** |
+| 8 | Documentación final y diagramas | Pendiente |
+| 9 | *(candidato)* GitOps con Argo CD o Flux | Idea |
 
 ---
 
@@ -138,6 +139,34 @@ kubectl logs -n falco -l app.kubernetes.io/name=falco --tail=200 \
 ```
 
 ---
+
+## Notas del Módulo 6 (ELK)
+
+Pipeline completo y funcionando: **Falco → Falcosidekick → Elasticsearch → Kibana**. Todo en el nodo agent vía `nodeSelector`.
+
+- `elk/01-elasticsearch.yaml`: StatefulSet de 1 réplica (ES 9.5.1), heap fijado en `-Xms1g -Xmx1g`, `fsGroup: 1000`, PVC de 10Gi con `local-path`. El storage class es `WaitForFirstConsumer`, así que **el volumen se crea en el disco del nodo donde cae el pod**: el `nodeSelector` no es optimización, es condición de corrección.
+- `elk/02-kibana.yaml`: Deployment (stateless, guarda su config dentro de ES) + Service `NodePort 30601`. Acceso: **http://192.168.122.128:30601**.
+- Falcosidekick se despliega como subchart desde `falco/values.yaml` (`falcosidekick.enabled: true`), lo que además cablea el `http_output` de Falco automáticamente. `webui` desactivada a propósito (requiere Redis).
+- Índices diarios `falco-YYYY.MM.DD`, así que el data view de Kibana debe usar el patrón **`falco-*`** con comodín.
+- Hay un `_index_template/falco` aplicado con `number_of_replicas: 0`. Los templates solo actúan en la creación, por eso el índice del día en que se aplicó siguió en `rep 1` (cluster en `yellow`, que con un solo nodo es el estado correcto).
+
+**Nota de contexto:** Juan tiene 4 años de experiencia con ELK en producción, HA y PCI-DSS. No corresponde explicarle Elastic; sí la capa de Kubernetes.
+
+**Deuda técnica identificada (su terreno, decisión suya):** el mapeo dinámico generó 29 campos con solo 9 documentos, 20 bajo `output_fields.*`, incluidos nombres con corchetes (`output_fields.proc.aname[2]`). Cada regla nueva agrega mappings. La opción conocida es mapear `output_fields` como `flattened`, a cambio de perder tipos numéricos.
+
+## Notas del Módulo 7 (seguridad en k8s)
+
+**7.1 — NetworkPolicies (hecho).** `netpol/01-elk-aislamiento.yaml`: default-deny de ingress en `elk`, más allow de ES:9200 solo desde el namespace `falco` o pods `app: kibana`, y allow de Kibana:5601 desde `ipBlock: 192.168.122.0/24`. Cierra la vulnerabilidad de la bitácora #11. Sin control de egress todavía.
+
+**7.2 — Pod Security con Kyverno (hecho).** `policies/02-pod-security.yaml`: `disallow-privileged` y `require-run-as-nonroot`, las dos en `Enforce`, con excepciones documentadas. Todas las cargas propias se arreglaron en lugar de exceptuarse: `web` pasó a `nginxinc/nginx-unprivileged:1.29-alpine` en el 8080 (uid 101), y ES, Kibana e `intruso` declaran su `securityContext`.
+
+Cosas para no reaprender:
+- **La excepción de Falco va por namespace Y label** (`app.kubernetes.io/name: falco`), no por namespace solo: falcosidekick vive ahí y no necesita privilegios.
+- **`runAsNonRoot: true` solo no alcanza** si la imagen declara `USER root` (busybox): el kubelet rechaza con `CreateContainerConfigError` y hay que indicar `runAsUser`.
+- **Siempre validar la excepción borrando los pods de Falco** y confirmando que el DaemonSet vuelve a 2/2. Si la excepción está mal, no falla nada visible: simplemente te quedás sin detección.
+- **Endurecer reduce la telemetría.** Con `intruso` como uid 1000, `cat /etc/shadow` da permission denied y **no genera alerta**, porque el macro `open_read` exige `fd.num >= 0`. El mismo ataque pasó de 2 alertas a 1.
+
+**7.3 y 7.4 pendientes:** `automountServiceAccountToken: false` como prevención que complementa la regla de robo de token, y demostrar `Drop and execute new binary in container` (ya existe en el set estable, usa `proc.is_exe_upper_layer`) — es la detección que cubre al atacante en un contenedor distroless, que tiene que traer su propio binario.
 
 ## Pendientes abiertos
 

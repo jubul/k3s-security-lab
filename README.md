@@ -16,10 +16,11 @@ El objetivo del repositorio no es demostrar que el stack levanta, sino documenta
 | 3 | Fundamentos: Namespace, Deployment, Service, labels | ✅ Completo |
 | 4 | Kyverno: admission control y políticas | ✅ Completo |
 | 5 | Falco: detección en runtime con eBPF | ✅ Completo |
-| 6 | Falcosidekick → Elasticsearch → Kibana | ⬜ Pendiente |
-| 7 | Documentación final y diagramas | ⬜ Pendiente |
+| 6 | Falcosidekick → Elasticsearch → Kibana | ✅ Completo |
+| 7 | NetworkPolicies y Pod Security | 🔨 2 de 4 |
+| 8 | Documentación final y diagramas | ⬜ Pendiente |
 
-**Verificado:** la suite de casos negativos de las políticas pasa 5 de 5 ([`tests/`](tests/)), y la regla propia de Falco detecta el robo de token de Service Account en dos imágenes con rutas de montaje distintas, con el ruido afinado de 804 alertas a 1.
+**Verificado:** la suite de casos negativos de las políticas pasa 5 de 5 ([`tests/`](tests/)); la regla propia de Falco detecta el robo de token de Service Account en dos imágenes con rutas de montaje distintas, con el ruido afinado de 804 alertas a 1; el pipeline indexa en Elasticsearch de punta a punta; y las políticas de Pod Security rechazan pods privilegiados y con root **sin dejar de permitir que el DaemonSet de Falco recree sus propios pods** — que es la prueba que valida el diseño de las excepciones.
 
 ---
 
@@ -81,9 +82,13 @@ Ninguna de las dos capas reemplaza a la otra, y esa es la tesis del lab.
 │   └── estado-sesion.md    Estado de avance y punto de retomada
 ├── infra/
 │   └── cloud-init/         user-data y meta-data de cada nodo (NoCloud)
-├── manifests/              Objetos de Kubernetes de la app de ejemplo
+├── manifests/              App de ejemplo y pod de simulación de ataques
 ├── policies/               ClusterPolicies de Kyverno
-└── tests/                  Casos negativos de las políticas (en construcción)
+├── falco/
+│   └── values.yaml         Configuración completa de Falco: driver, salida y reglas propias
+├── elk/                    Elasticsearch (StatefulSet) y Kibana (Deployment)
+├── netpol/                 NetworkPolicies de aislamiento
+└── tests/                  Casos negativos de las políticas, con resultados esperados
 ```
 
 ---
@@ -292,7 +297,11 @@ Si vas a leer una sola cosa, leé la [bitácora](docs/bitacora.md). Ocho inciden
 
 **Una regla de detección correcta y, tal como estaba, inservible.** La regla propia de robo de token de Service Account funcionaba: detectaba el ataque. También generaba **804 alertas con 2 verdaderos positivos** — un 0,25% de señal, porque todo componente de Kubernetes lee su propio token para autenticarse. Afinarla exigió antes arreglar la visibilidad (Falco solo emite en el JSON los campos que la plantilla `output` referencia, así que los campos de proceso venían vacíos), y trajo dos hallazgos sobre los campos disponibles: `proc.name` se trunca a 15 caracteres porque viene del `comm` del kernel, y `proc.exepath` colapsa los binarios multi-llamada — en Alpine `cat` reporta `/bin/busybox`. Ninguno de los dos sirve para todo.
 
-**Un patrón que se repitió cuatro veces.** El instrumento de medición produciendo la conclusión: un `head -5` que llevó a afirmar que no había servidor DHCP cuando sí lo había, un `grep -i warning` que ocultó una detección de prioridad `NOTICE`, un caso de prueba que no cubría la intersección de dos condiciones, y un error de capitalización que hacía que una validación se salteara sin fallar. Ninguno de los cuatro avisó de que estaba recortando.
+**Un SIEM que el atacante podía borrar.** Auditando el cluster antes de escribir políticas apareció que cualquier pod alcanzaba Elasticsearch sin autenticar: se verificó creando y borrando un índice de prueba **desde el pod comprometido**, armando el request HTTP a mano con `nc` porque el `wget` de BusyBox no soporta `--method`. Es decir, un atacante podía eliminar los índices que registraron su propia intrusión, con las herramientas que ya venían en una imagen mínima. Se mitigó con NetworkPolicies; la lección de diseño es que el SIEM no debería vivir dentro de la frontera de confianza del sistema que vigila.
+
+**Endurecer también apaga la telemetría.** Al pasar el pod de simulación de root a uid 1000, el mismo ataque dejó de generar dos alertas y generó una: `cat /etc/shadow` ahora da *permission denied*, y el macro `open_read` de Falco exige un descriptor abierto de verdad (`fd.num >= 0`), así que **un open fallido no matchea ninguna regla**. El ataque falló, pero el intento tampoco quedó registrado. Es una interacción entre la capa de prevención y la de detección que no aparece en los tutoriales.
+
+**Un patrón que se repitió siete veces.** El instrumento de medición produciendo la conclusión: un `head -5` que llevó a afirmar que no había servidor DHCP cuando sí lo había; un `grep -i warning` que ocultó una detección de prioridad `NOTICE`; un `ignore_above: 256` que hace que una agregación de Kibana devuelva vacío sin error; un `jq` accediendo a un campo ausente que dejó un inventario de violaciones en blanco; un `tail -4` que escondió una de las dos reglas que sí habían rechazado un pod; un caso de prueba que no cubría la intersección de dos condiciones; y un error de capitalización que hacía que una validación se salteara sin fallar. **Ninguno de los siete avisó de que estaba recortando** — y varios ocurrieron después de haber identificado el patrón, que es justamente lo que lo hace interesante.
 
 ---
 
@@ -300,10 +309,16 @@ Si vas a leer una sola cosa, leé la [bitácora](docs/bitacora.md). Ocho inciden
 
 - [x] Políticas de Kyverno con casos negativos versionados en `tests/`
 - [x] Falco con modern eBPF, regla propia y validación con eventos reales
+- [x] Pipeline Falcosidekick → Elasticsearch → Kibana
+- [x] NetworkPolicies aislando la evidencia de las cargas del cluster
+- [x] Pod Security: prohibir `privileged` y exigir `runAsNonRoot`, con excepciones quirúrgicas
+- [ ] `automountServiceAccountToken: false` donde no se necesita: prevención que complementa la regla de robo de token
+- [ ] Demostrar `Drop and execute new binary in container` — la detección que cubre al atacante en contenedores distroless, que debe traer su propio binario
+- [ ] Completar Pod Security: `readOnlyRootFilesystem`, prohibir `hostPath`, `hostNetwork` y `hostPID`, exigir `seccompProfile: RuntimeDefault`
+- [ ] NetworkPolicies de egress (hoy solo se controla el ingress)
+- [ ] Habilitar `xpack.security` con TLS en Elasticsearch: hoy el aislamiento es solo de red
 - [ ] Migrar `tests/` a `kyverno test` para correrlo en CI: con `kubectl apply --dry-run` el exit code queda invertido para casos negativos
-- [ ] Políticas de Pod Security: `runAsNonRoot`, `readOnlyRootFilesystem`, prohibir `privileged` y `hostPath`
-- [ ] Falcosidekick → Elasticsearch, con dashboards de Kibana
+- [ ] RBAC propio del namespace `falco`, que es la vía privilegiada hacia la evidencia
 - [ ] Diagrama de arquitectura y modelo de amenazas
 - [ ] Scripts `infra/lab-up.sh` y `lab-down.sh` para levantar y bajar el lab
-- [ ] Evaluar IPs estáticas vía `network-config` en la semilla NoCloud
 - [ ] *(candidato)* GitOps con Argo CD o Flux, que elimina por diseño el desfase entre lo declarado en el repo y lo aplicado en el cluster
